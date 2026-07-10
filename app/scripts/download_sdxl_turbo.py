@@ -25,8 +25,7 @@ def main():
     )
     print()
     print("Done:", out_dir)
-    print("Verify:")
-    print(r"  ..\venv\Scripts\python.exe sketch_pipeline.py --check-sketch-model")
+    print("Verify: launch BlobVision.bat and use Redux — SDXL Turbo loads from models/sdxl-turbo/")
 
 
 if __name__ == "__main__":

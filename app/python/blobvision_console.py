@@ -5,13 +5,18 @@ import os
 import sys
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BLOBDREAM_ROOT = os.path.dirname(SCRIPT_DIR)
-VENV_PYTHON = os.path.join(BLOBDREAM_ROOT, "venv", "Scripts", "python.exe")
-TAMING_REPO = os.path.join(BLOBDREAM_ROOT, "taming-transformers")
+APP_DIR = os.path.dirname(SCRIPT_DIR)
+BLOBVISION_ROOT = os.path.dirname(APP_DIR)
+BLOBDREAM_ROOT = BLOBVISION_ROOT
+VENV_PYTHON = os.path.join(BLOBVISION_ROOT, "venv", "Scripts", "python.exe")
 MAX_ITERATIONS = 500
 
 os.chdir(SCRIPT_DIR)
-for path in (SCRIPT_DIR, TAMING_REPO, BLOBDREAM_ROOT):
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+from blobvision_paths import TAMING_REPO
+
+for path in (SCRIPT_DIR, TAMING_REPO, BLOBVISION_ROOT):
     if path not in sys.path and os.path.isdir(path):
         sys.path.insert(0, path)
 

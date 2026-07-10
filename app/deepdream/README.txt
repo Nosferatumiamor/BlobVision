@@ -2,7 +2,7 @@ BlobVision — DeepDream branch
 ===========================
 
 Code: app/python/blobvision_deepdream.py
-Outputs: app/outputs/deepdream/
+Outputs: outputs/deepdream/
 
 Uses torchvision InceptionV3 (ImageNet weights). On first run PyTorch downloads weights into its cache (~100MB) unless already present.
 

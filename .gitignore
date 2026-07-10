@@ -25,9 +25,21 @@ video-codecs/rife/
 # Legacy app-local caches (migrated to models/ on first run)
 app/checkpoints/
 app/outputs/
+app/style-transfer/weights/
+app/style-transfer/samples/
+taming-transformers/
+
+# Safety net — never commit weights
+*.ckpt
+*.safetensors
+*.pth
+
+# Local logs
+*.log
 
 # OS / editor
 Thumbs.db
 .DS_Store
 .vscode/
 .idea/
+.cursor/
