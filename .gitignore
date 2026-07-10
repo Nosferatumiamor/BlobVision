@@ -1,0 +1,33 @@
+# BlobVision V1
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Downloaded weights (install on first launch via in-app buttons or app/scripts/)
+models/*
+!models/README.txt
+models/hf_cache/
+
+# Generated outputs
+outputs/*
+!outputs/.gitkeep
+
+# Bundled video tools (run Setup Video Codecs.bat once)
+video-codecs/ffmpeg/
+video-codecs/rife/
+!video-codecs/README.txt
+
+# Legacy app-local caches (migrated to models/ on first run)
+app/checkpoints/
+app/outputs/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/

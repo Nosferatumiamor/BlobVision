@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Editor
+.vscode/
+
+# Local operations (gitignored at repo root too)
+outputs/
+steps/
+output.png
+steps.mp4
