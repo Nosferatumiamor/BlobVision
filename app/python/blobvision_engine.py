@@ -353,7 +353,293 @@ def _downsample_frame_paths_to_count(frames, target_count):
         last_idx = idx
     return picked
 VQGAN_NEGATIVE_WEIGHT = -1.0
-SDXL_CFG_WITH_NEGATIVE = 1.0
+# diffusers only turns on classifier-free guidance when guidance_scale > 1 (strictly —
+# see StableDiffusionXLImg2ImgPipeline.do_classifier_free_guidance:
+# `self._guidance_scale > 1 and ...`). At exactly 1.0 this was a silent no-op: every
+# negative_prompt passed anywhere SDXL Turbo is used (style presets, VQGAN/DeepDream
+# redux sketches) had zero effect on the actual generation. 1.5 is a real, working CFG
+# value — validated on the photorealistic preset fixing a structural face-warp/artifact
+# issue that no amount of negative_prompt wording could touch while this was inert.
+# (2.0 was tried first but produced visibly worse results on direct comparison.)
+SDXL_CFG_WITH_NEGATIVE = 1.5
+
+# SDXL Turbo img2img "restyle" presets for the Style Transfer family — an alternative to
+# the classic VGG19 Gatys optimizer. strength = diffusers' img2img strength (0 = keep
+# input, 1 = ignore it); higher-concept prompts (Gothic, medieval, cave painting) tend to
+# reinterpret the whole scene rather than just restyle it, even at moderate strength, so
+# their defaults sit lower than the pure-texture/medium styles.
+#
+# Two tested lessons baked into these prompts:
+# 1. Painting/drawing styles need their TOOL named explicitly (oil on canvas, acrylic,
+#    watercolor washes, engraving crosshatch...) — without it the result reads as a
+#    generic filter rather than the actual medium.
+# 2. Named-artist prompts are wildly inconsistent depending on how well-represented that
+#    artist is in the base model's training data. Famous 20th-century fine artists
+#    (Basquiat, Miro, Klee) restyle strongly and are genuinely recognizable. Niche comic
+#    artists (tested: Kawajiri, Miura, Toriyama, Mark Schultz) came back almost unchanged
+#    at these settings — those are deliberately left out. Naming a painter whose own
+#    self-portraits dominate their tagged work (e.g. literally "Van Gogh") can also pull
+#    toward THAT face rather than restyling the input — safer to describe the technique
+#    (brushwork, palette) than to lean on the name for those cases.
+# "Black and white" presets (engraving, silent-film, some photo styles) were only tested
+# on an already-illustrated, already-colored source image and came back tinted rather than
+# true monochrome there — a negative_prompt nudge is included to push harder toward mono,
+# but this is untested against a real photo input, which is the actual intended use case.
+# "Pointillism" as a literal dot technique never rendered visible dots at any tested
+# strength/step count and was dropped — reframed into a broader Impressionism preset
+# ("undefined suggested brushwork" rather than naming the dot technique) which worked well.
+# Scene-hijacking styles (Gothic, Medieval, Bayeux Tapestry, Poussin) have a narrow or
+# nonexistent middle ground on the tested source image: too low a strength barely touches
+# it, and the jump to "actually stylized" tends to also fully reinvent the composition into
+# a new scene rather than restyling the existing subject — there wasn't a strength value
+# found that reliably restyles-without-reinventing for these specific prompts.
+# Photorealistic/fashion/documentary/street/Newton/Larry-Clark photo presets did not
+# meaningfully transform the (already-illustrated) test image even at 0.55 strength — an
+# illustration input has a lot of "this is a drawing" prior to overcome. These are kept in
+# because the concept is sound and a real photo input is the actual target use case, but
+# they are the least field-tested presets in this set.
+# The 80s cartoon preset originally named "He-Man Masters of the Universe" directly, which
+# pulled the subject toward He-Man's own specific look (masculine jaw/build) rather than
+# just applying the era's animation texture — same "named character dominates the result"
+# effect as the Van Gogh case above. Rephrased around the toy-box-art/Filmation-era studio
+# style instead of the character name, which keeps the subject intact.
+STYLE_PRESETS = {
+    "ghibli": {
+        "label": "Studio Ghibli",
+        "prompt": "Studio Ghibli anime style, soft painterly watercolor, hand-drawn, warm colors",
+        "strength": 0.5,
+    },
+    "disney": {
+        "label": "Disney Animation",
+        "prompt": "classic Disney animated film style, clean bold outlines, warm expressive character design, soft cel shading, storybook illustration",
+        "strength": 0.5,
+    },
+    "heman": {
+        "label": "80s Cartoon (Filmation)",
+        "prompt": "1980s toy action figure box art illustration, airbrushed painted cover art, bold heroic fantasy proportions, thick black outlines, flat saturated colors, vintage Saturday morning cartoon aesthetic",
+        "strength": 0.5,
+    },
+    "albator": {
+        "label": "80s Anime (Albator/Ulysse 31)",
+        "prompt": "early 1980s French-Japanese anime style, in the style of Captain Harlock and Ulysses 31, retro sci-fi character design, simple bold linework, muted vintage color palette, cel animation texture",
+        "strength": 0.5,
+    },
+    "plympton": {
+        "label": "Rough Pencil (Bill Plympton)",
+        "prompt": "hand-drawn rough pencil sketch animation style, in the style of Bill Plympton, wobbly uneven linework, grotesque exaggerated features, colored pencil texture, surreal morphing look",
+        "strength": 0.5,
+    },
+    "ren_stimpy": {
+        "label": "Gross-out Cartoon (Ren & Stimpy)",
+        "prompt": "1990s Nickelodeon cartoon style, in the style of Ren and Stimpy, exaggerated grotesque close-up features, rubbery character design, bright saturated colors, wild bulging eyes",
+        "strength": 0.55,
+    },
+    "spitting_image": {
+        "label": "Latex Puppet (Spitting Image)",
+        "prompt": "satirical latex puppet, in the style of Spitting Image, exaggerated grotesque caricature features, rubbery foam latex skin texture, oversized head proportions, studio puppet photography",
+        # Same leftover-linework-as-microtexture issue as the photorealistic preset can
+        # show up here too, but unlike that preset, wrinkles/creases are wanted (part of
+        # the exaggerated latex caricature look) — only the mud-crack failure mode itself
+        # is excluded, not wrinkles.
+        "negative_prompt": "cracked skin, cracked texture, mud texture, reptile skin, dry skin",
+        "strength": 0.5,
+    },
+    "muppet": {
+        "label": "Felt Puppet (Muppet)",
+        "prompt": "felt puppet character, in the style of the Muppets by Jim Henson, fuzzy colorful felt texture, big round googly eyes, soft plush stitched seams, warm stage lighting",
+        "strength": 0.5,
+    },
+    "fumetti": {
+        "label": "Fumetti (Dylan Dog/Diabolik)",
+        "prompt": "Italian fumetti comic book art, in the style of Dylan Dog and Diabolik, high contrast black and white ink, moody noir chiaroscuro shading, atmospheric horror thriller illustration",
+        "strength": 0.5,
+        "negative_prompt": "color, colorful",
+    },
+    "russian_animation": {
+        "label": "Soviet Animation",
+        "prompt": "Soviet era Russian animation style, thick painterly hand-brushed oil texture, muted folk-art earthy color palette, atmospheric hazy soft lighting, grainy film texture, in the style of Soyuzmultfilm and Yuri Norstein",
+        "strength": 0.6,
+    },
+    "bakshi": {
+        "label": "Rotoscope (Bakshi)",
+        "prompt": "1970s rotoscoped animation still, in the style of Ralph Bakshi, gritty painted psychedelic backgrounds, semi-realistic rough wobbly linework, muted grainy smoky color palette, underground adult animation look",
+        "strength": 0.6,
+    },
+    "artstation": {
+        "label": "ArtStation Epic",
+        "prompt": "epic fantasy digital painting, dramatic lighting, trending on artstation, highly detailed illustration",
+        "strength": 0.45,
+    },
+    "watercolor": {
+        "label": "Watercolor",
+        "prompt": "watercolor painting, translucent liquid washes, bleeding wet-on-wet edges, visible paper texture, soft pigment bloom",
+        "strength": 0.45,
+    },
+    "impressionism": {
+        "label": "Impressionism",
+        "prompt": "impressionist painting, thick daubs of acrylic paint on canvas, undefined suggested brushwork, forms dissolving into color and light, soft blurred edges, visible textured strokes",
+        "strength": 0.55,
+    },
+    "poussin": {
+        "label": "Classical (Poussin)",
+        "prompt": "French classical baroque oil painting, in the style of Nicolas Poussin, smooth idealized academic brushwork, warm earthy color palette, dramatic sculptural lighting",
+        "strength": 0.5,
+    },
+    "cubism": {
+        "label": "Cubism",
+        "prompt": "cubist painting, geometric fragmented shapes, multiple perspectives, bold angular lines",
+        "strength": 0.45,
+    },
+    "german_expressionism": {
+        "label": "German Expressionism",
+        "prompt": "German Expressionist painting, bold jagged brushstrokes, intense emotional colors, distorted forms",
+        "strength": 0.5,
+    },
+    "basquiat": {
+        "label": "Neo-Expressionist (Basquiat)",
+        "prompt": "neo-expressionist painting in the style of Jean-Michel Basquiat, raw crude figures, scrawled text and symbols, bold color blocks, graffiti texture on canvas",
+        "strength": 0.5,
+    },
+    "miro": {
+        "label": "Surrealist (Miro)",
+        "prompt": "surrealist painting in the style of Joan Miro, biomorphic shapes, bold primary colors, playful abstract symbols, flat color fields",
+        "strength": 0.5,
+    },
+    "klee": {
+        "label": "Abstract (Klee)",
+        "prompt": "whimsical abstract painting in the style of Paul Klee, delicate geometric linework, muted color fields, childlike symbolic forms",
+        "strength": 0.5,
+    },
+    "gothic": {
+        "label": "Gothic Painting",
+        "prompt": "Gothic medieval painting, flat golden background, elongated figures, religious icon style",
+        "strength": 0.4,
+    },
+    "medieval": {
+        "label": "Medieval Manuscript",
+        "prompt": "medieval illuminated manuscript painting, flat perspective, decorative borders, tempera colors",
+        "strength": 0.4,
+    },
+    "bayeux": {
+        "label": "Tapestry (Bayeux)",
+        "prompt": "medieval tapestry embroidery, coarse wool thread texture on linen fabric, flat naive stylized figures with simple outlines, narrow earthy color palette of red ochre and gold, decorative border, in the style of the Bayeux Tapestry",
+        "strength": 0.4,
+    },
+    "cave": {
+        "label": "Cave Painting",
+        "prompt": "prehistoric cave painting, ochre and charcoal pigments, primitive rock art style",
+        "strength": 0.4,
+    },
+    "dore_engraving": {
+        "label": "19th c. Engraving (Dore)",
+        "prompt": "19th century engraving illustration, fine crosshatch linework, dramatic black and white chiaroscuro, in the style of Gustave Dore",
+        "strength": 0.5,
+        "negative_prompt": "color, colorful, painting",
+    },
+    "german_expr_cinema": {
+        "label": "German Expressionist Cinema",
+        "prompt": "black and white German Expressionist silent film still, extreme high contrast, sharp angular shadows, in the style of Nosferatu and The Cabinet of Dr Caligari",
+        "strength": 0.5,
+        "negative_prompt": "color, colorful",
+    },
+    "manga": {
+        "label": "Manga (B&W)",
+        "prompt": "1990s shonen manga style, black and white ink, dense screentone halftone shading, dynamic action lines, retro manga print texture",
+        "strength": 0.55,
+        "negative_prompt": "color, colorful",
+    },
+    "tezuka": {
+        "label": "Retro Anime (Tezuka)",
+        "prompt": "in the style of Osamu Tezuka manga and anime, retro 1960s cartoon character design, simple bold linework, big expressive eyes, vintage anime look",
+        "strength": 0.5,
+    },
+    "bd_francobelge": {
+        "label": "Franco-Belgian BD",
+        "prompt": "Franco-Belgian comic album style, ligne claire, flat bold colors, clean outlines",
+        "strength": 0.5,
+    },
+    "comics_70s80s": {
+        "label": "Comics (70s-80s)",
+        "prompt": "1970s 1980s comic book illustration, bold ink outlines, Ben-Day dots, saturated flat colors, dynamic action pose, vintage newsprint texture",
+        "strength": 0.5,
+    },
+    "pulp_50s": {
+        "label": "Pulp Comic (50s)",
+        "prompt": "1950s pulp comic book cover art, bold saturated colors, dramatic illustration, halftone print texture, vintage adventure magazine style",
+        "strength": 0.5,
+    },
+    "western_comic": {
+        "label": "Western Comic",
+        "prompt": "western comic book style, bold ink outlines, halftone dots, vibrant primary colors",
+        "strength": 0.55,
+    },
+    "photorealistic": {
+        "label": "Photorealistic",
+        "prompt": "photograph of a real human, natural human face proportions, single undistorted head, one pair of eyes, symmetrical face, correct human anatomy, smooth realistic skin, soft photographic lighting, DSLR photo, real hair strands",
+        # "with pores" / "8k detail" in the prompt, combined with the source's anime
+        # linework (nose lines, cheek shading strokes) surviving partial denoising,
+        # made the model render those leftover edges as hyper-detailed micro-texture —
+        # a cracked/leathery "dried mud" skin/blood-streak artifact. Dropping that
+        # phrasing and banning it explicitly below fixed most of it, but the deeper fix
+        # was discovered later: SDXL_CFG_WITH_NEGATIVE was 1.0, which diffusers silently
+        # treats as "no CFG" (needs strictly > 1) — this negative_prompt had never
+        # actually been applied to any generation. See SDXL_CFG_WITH_NEGATIVE.
+        # Fresh-seed testing at strength=0.5/steps=14 (post-CFG-fix) surfaced a second,
+        # separate failure mode from the mud-crack one: an elongated/stretched skull and,
+        # on one seed, a full duplicate row of eyes — ordinary SDXL img2img anatomy
+        # drift, unrelated to caption or CFG. Added explicit anti-duplication/
+        # anti-elongation terms below (and mirrored as positive instructions above) now
+        # that CFG is confirmed to actually apply.
+        "negative_prompt": "anime, cartoon, illustration, drawing, painting, cel shading, big glossy eyes, flat colors, line art, cracked skin, cracked texture, wrinkles, veins, scars, dry skin, leathery skin, reptile skin, mud texture, blood, bloody, blood splatter, cuts, scratches, wounds, red marks, red streaks, extra eyes, duplicate eyes, second pair of eyes, three eyes, extra face, duplicate face, elongated head, stretched head, deformed skull, distorted proportions, disfigured, mutated anatomy, malformed",
+        # strength=0.8/steps=12 got photorealistic skin but always erased non-human
+        # source details (animal ears, expressions) entirely, no matter the prompt —
+        # too much of the trajectory was unconditioned on the source. Caption-assist
+        # (blobvision_caption.py, auto-injects a description of the actual source
+        # subject into the prompt) plus a real working negative_prompt let much lower
+        # strength reach the same photorealism while keeping those details. steps=8
+        # (~4 effective denoising steps, matching SDXL Turbo's native distillation
+        # regime) got the texture/style right but wasn't enough iteration to keep facial
+        # geometry stable — elongated jaw, misaligned eyes on some seeds. steps=14 (~7
+        # effective) fixed the geometry while keeping everything else.
+        "strength": 0.5,
+        "steps": 14,
+    },
+    "fashion_photo": {
+        "label": "Fashion Photo",
+        "prompt": "high fashion editorial photograph, studio lighting, glossy magazine quality, sharp focus, dramatic pose",
+        "strength": 0.55,
+    },
+    "documentary_photo": {
+        "label": "Documentary Photo",
+        "prompt": "documentary photograph, natural available light, candid realism, photojournalistic style, film grain",
+        "strength": 0.55,
+    },
+    "street_photo": {
+        "label": "Street Photo (Cartier-Bresson)",
+        "prompt": "black and white street photograph, candid decisive moment composition, high contrast film grain, 35mm photojournalism, in the style of Henri Cartier-Bresson",
+        "strength": 0.55,
+        "negative_prompt": "color, colorful, painting, illustration",
+    },
+    "newton_photo": {
+        "label": "Studio Photo (Newton)",
+        "prompt": "black and white fashion photograph, high contrast dramatic studio lighting, glamorous provocative pose, in the style of Helmut Newton",
+        "strength": 0.55,
+        "negative_prompt": "color, colorful, painting, illustration",
+    },
+    "larry_clark_photo": {
+        "label": "Snapshot (Larry Clark)",
+        "prompt": "raw gritty documentary snapshot photograph, harsh flash lighting, grainy film texture, youth subculture aesthetic, in the style of Larry Clark",
+        "strength": 0.55,
+        "negative_prompt": "painting, illustration",
+    },
+    "custom": {
+        "label": "Custom",
+        "prompt": "",
+        "strength": 0.5,
+    },
+}
+DEFAULT_STYLE_PRESET = "ghibli"
+STYLE_PRESET_STEPS = 8
 
 SKETCH_MARKERS = [
     "model_index.json",
@@ -371,6 +657,13 @@ class GenerateResult:
     denoise_fidelity: Optional[float]
     output_path: str
     sketch_path: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class StylePresetResult:
+    output_path: str
+    seed: int
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -630,6 +923,8 @@ class BlobVisionEngine:
 
         self._lock = threading.Lock()
         self._sketch_pipe = None
+        self._sketch_img2img_pipe = None
+        self._caption_engine = None
         self._vqgan_loaded = False
         self._vqgan_clip_key = None
         self._counter = 1
@@ -664,8 +959,19 @@ class BlobVisionEngine:
     def sdxl_ready(self):
         return self._sketch_pipe is not None
 
-    def warmup_staged(self, on_stage=None, on_vqgan_ready=None, on_sdxl_ready=None):
-        """Load VQGAN then SDXL with GPU burst prep (VRAM flush + TF32)."""
+    def warmup_staged(
+        self, on_stage=None, on_vqgan_ready=None, on_sdxl_ready=None,
+        get_current_family=None,
+    ):
+        """Load SDXL then VQGAN, with GPU burst prep (VRAM flush + TF32).
+
+        SDXL goes first: it's the sketch pass every family can use (VQGAN redux,
+        DeepDream redux/txt2img), so it unblocks the most paths soonest. Once SDXL is
+        ready, `get_current_family()` (if given) is consulted — if the user is
+        already looking at DeepDream or Style (neither ever needs VQGAN), VQGAN load
+        is deferred to a background thread instead of blocking readiness; otherwise
+        (VQGAN tab, or family unknown) it loads synchronously as before.
+        """
 
         def stage(msg):
             log_line(msg, on_stage)
@@ -705,19 +1011,42 @@ class BlobVisionEngine:
         )
 
         with self._lock:
-            stage("Loading VQGAN + CLIP...")
-            self._ensure_vqgan("redux", DEFAULT_ITERATIONS["redux"])
-            self._vram.note_vqgan_loaded_on_gpu()
-        if on_vqgan_ready:
-            on_vqgan_ready()
-
-        with self._lock:
             stage("Loading SDXL Turbo (local checkpoints)...")
             self._load_sketch_pipe(on_stage=on_stage)
             self._vram.note_sketch_loaded_on_gpu()
             self._vram.activate(BlobVRAMCache.PHASE_SKETCH)
         if on_sdxl_ready:
             on_sdxl_ready()
+
+        family = get_current_family() if get_current_family else None
+        if family in ("deepdream", "style"):
+            stage("Ready (VQGAN loading in background)...")
+
+            def _load_vqgan_background():
+                try:
+                    with self._lock:
+                        log_line("Loading VQGAN + CLIP (background)...", on_stage)
+                        self._ensure_vqgan("redux", DEFAULT_ITERATIONS["redux"])
+                        self._vram.note_vqgan_loaded_on_gpu()
+                        self._vram._park_vqgan(on_stage)
+                    if on_vqgan_ready:
+                        on_vqgan_ready()
+                except Exception as exc:
+                    log_line("Background VQGAN load failed: {}".format(exc), on_stage)
+
+            threading.Thread(target=_load_vqgan_background, daemon=True).start()
+            return
+
+        with self._lock:
+            stage("Loading VQGAN + CLIP...")
+            self._ensure_vqgan("redux", DEFAULT_ITERATIONS["redux"])
+            self._vram.note_vqgan_loaded_on_gpu()
+            # SDXL (the active phase) is already on GPU — park VQGAN straight back off
+            # instead of activate(PHASE_SKETCH), which would no-op since it's already
+            # the active phase and silently leave both stacks resident.
+            self._vram._park_vqgan(on_stage)
+        if on_vqgan_ready:
+            on_vqgan_ready()
         stage("Ready")
 
     def warmup_full(self, on_stage=None):
@@ -746,6 +1075,9 @@ class BlobVisionEngine:
                 print("Disconnect: SDXL Turbo removed from memory.", flush=True)
             else:
                 print("Disconnect: SDXL Turbo was not loaded.", flush=True)
+            if self._caption_engine is not None:
+                self._caption_engine.unload()
+                self._caption_engine = None
             if had_vqgan:
                 print("Disconnect: unloading VQGAN + CLIP...", flush=True)
                 import generate as gen_eng
@@ -1059,9 +1391,110 @@ class BlobVisionEngine:
         import torch
         del self._sketch_pipe
         self._sketch_pipe = None
+        self._sketch_img2img_pipe = None
         gc.collect()
         if self.cuda_device.startswith("cuda"):
             torch.cuda.empty_cache()
+
+    def _load_sketch_img2img_pipe(self):
+        """img2img view of the SDXL Turbo pipeline (shares weights, no extra load)."""
+        self._load_sketch_pipe()
+        if self._sketch_img2img_pipe is None:
+            from diffusers import AutoPipelineForImage2Image
+            self._sketch_img2img_pipe = AutoPipelineForImage2Image.from_pipe(self._sketch_pipe)
+        return self._sketch_img2img_pipe
+
+    def _load_caption_engine(self):
+        if self._caption_engine is None:
+            from blobvision_caption import CaptionEngine
+
+            self._caption_engine = CaptionEngine(device=self.cuda_device)
+        return self._caption_engine
+
+    def generate_style_preset(
+        self,
+        image_path,
+        prompt,
+        strength,
+        seed=None,
+        negative_prompt=None,
+        steps=STYLE_PRESET_STEPS,
+        width=None,
+        height=None,
+        output_dir=None,
+        on_progress=None,
+    ):
+        """SDXL Turbo img2img restyle — the preset-driven alternative to VGG19 Style
+        Transfer. Reuses the already-loaded sketch pipeline's weights via from_pipe()
+        rather than loading a second checkpoint."""
+        import torch
+        from PIL import Image
+
+        if not image_path or not os.path.isfile(image_path):
+            raise ValueError("image_path is required")
+        if not prompt or not prompt.strip():
+            raise ValueError("prompt is required")
+        actual_seed = resolve_seed(seed)
+
+        # Auto-describe the source subject (animal ears, expression, accessories...) so
+        # the static preset prompt doesn't silently erase details it has no way of
+        # knowing about. Best-effort: falls back to the preset prompt alone if the
+        # caption model isn't installed or captioning fails for any reason.
+        from blobvision_caption import caption_weights_status
+
+        final_prompt = prompt.strip()
+        if caption_weights_status()["ready"]:
+            caption = self._load_caption_engine().describe(image_path, on_progress=on_progress)
+            if caption:
+                final_prompt = "{}, {}".format(final_prompt, caption)
+
+        with self._lock:
+            pipe = self._load_sketch_img2img_pipe()
+            self._vram.note_sketch_loaded_on_gpu()
+            self._vram.activate(BlobVRAMCache.PHASE_SKETCH)
+            img = Image.open(image_path).convert("RGB")
+            if width and height:
+                img = img.resize((int(width), int(height)), Image.LANCZOS)
+            else:
+                w, h = snap_sdxl_dims(img.width, img.height)
+                img = img.resize((w, h), Image.LANCZOS)
+            generator = torch.Generator(self.cuda_device).manual_seed(actual_seed)
+            neg = (negative_prompt or "").strip() or None
+            guidance = SDXL_CFG_WITH_NEGATIVE if neg else 0.0
+            steps = max(1, min(int(steps), 20))
+            if on_progress:
+                on_progress("SDXL restyle ({}x{}, strength={})...".format(img.width, img.height, strength))
+            result = pipe(
+                prompt=final_prompt,
+                negative_prompt=neg,
+                image=img,
+                strength=float(strength),
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                generator=generator,
+            )
+            out_dir = os.path.abspath(output_dir or self.output_dir)
+            os.makedirs(out_dir, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            tag = "style_sdxl_{}_{:04d}".format(stamp, self._counter)
+            self._counter += 1
+            output_path = os.path.join(out_dir, tag + ".png")
+            result.images[0].save(output_path)
+            del result
+        if on_progress:
+            on_progress("Saved " + os.path.basename(output_path))
+        meta = {
+            "family": "style-sdxl",
+            "prompt": final_prompt,
+            "negative_prompt": neg or "",
+            "strength": float(strength),
+            "steps": int(steps),
+            "seed": int(actual_seed),
+            "width": img.width,
+            "height": img.height,
+            "output": os.path.basename(output_path),
+        }
+        return StylePresetResult(output_path=output_path, seed=int(actual_seed), metadata=meta)
 
     def generate_redux_sketch(
         self,

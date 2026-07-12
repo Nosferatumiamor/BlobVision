@@ -68,16 +68,19 @@ from blobvision_engine import (
     VQ_VIDEO_FRAME_STEP_CHOICES,
     DEFAULT_VQ_VIDEO_FRAME_STEP,
     parse_vq_video_frame_step,
+    STYLE_PRESETS,
+    DEFAULT_STYLE_PRESET,
+    STYLE_PRESET_STEPS,
 )
 
 from blobvision_deepdream import (
     DeepDreamEngine,
-    DEFAULT_STEPS as DD_DEFAULT_STEPS,
-    DEFAULT_OCTAVES as DD_DEFAULT_OCTAVES,
     DEFAULT_LAYER as DD_DEFAULT_LAYER,
-    PRESERVE_IMG2IMG as DD_DEFAULT_PRESERVE,
     INCEPTION_LAYERS as DD_LAYERS,
+    intensity_to_params as dd_intensity_to_params,
 )
+
+DD_DEFAULT_INTENSITY = 85
 
 from blobvision_style import (
     StyleTransferEngine,
@@ -87,6 +90,8 @@ from blobvision_style import (
     download_style_transfer_weights,
     style_transfer_weights_status,
 )
+
+from blobvision_upscale import UpscaleEngine
 
 MODE_BLURBS = {
     "redux": "SDXL sketch → VQGAN blob. Fast default.",
@@ -100,6 +105,9 @@ DD_MODE_BLURBS = {
 }
 
 ST_MODE_BLURB = "Drop a content photo + a style reference on the right, then DEGENERATE."
+ST_SDXL_MODE_BLURB = "Drop a photo on the right, pick a preset (or write your own), then DEGENERATE."
+NO_PRESET_VALUE = ""
+NO_PRESET_LABEL = "— None (classic style transfer) —"
 
 FAMILY_META = {
     "vqgan": {"label": "VQGAN+CLIP", "enabled": True, "tagline": "Retro AI Slop Emulator"},
@@ -174,8 +182,7 @@ function() {
 PROMPT_ENTER_JS = ""  # superseded by BLOB_JS_HOOK
 
 BLOB_JS_HOOK = """
-<script>
-(function() {
+function() {
     if (window.__blobAllHooked) return;
     window.__blobAllHooked = true;
     document.querySelector('.gradio-container')?.setAttribute('data-blob-family','vqgan');
@@ -185,28 +192,32 @@ BLOB_JS_HOOK = """
     window.addEventListener('drop', function(e) { e.preventDefault(); });
 
     // 1) Enter key in prompt -> DEGENERATE
+    // A capture-phase listener on document (not per-textarea) so it: (a) survives
+    // Gradio re-rendering the textarea DOM node, and (b) runs before Gradio's own
+    // keydown handling can swallow the event. Only the currently-visible DEGENERATE
+    // button is clicked — all three families reuse that label, and the other two are
+    // still present (just display:none) in the DOM at any given time.
     function findGenBtn() {
         var btns = document.querySelectorAll('button');
         for (var i = 0; i < btns.length; i++) {
-            if (btns[i].textContent.trim().toUpperCase() === 'DEGENERATE') return btns[i];
+            var b = btns[i];
+            if (b.textContent.trim().toUpperCase() === 'DEGENERATE' && b.offsetParent !== null) {
+                return b;
+            }
         }
         return null;
     }
-    function hookEnter() {
-        var areas = document.querySelectorAll('#blob-sidebar-wrap textarea');
-        if (!areas.length) { setTimeout(hookEnter, 500); return; }
-        for (var i = 0; i < areas.length; i++) {
-            areas[i].addEventListener('keydown', function(e) {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    var btn = findGenBtn();
-                    if (btn) btn.click();
-                }
-            });
-        }
-    }
-    hookEnter();
-    setTimeout(hookEnter, 2000);
+    document.addEventListener('keydown', function(e) {
+        if (e.key !== 'Enter' || e.shiftKey) return;
+        var target = e.target;
+        if (!target || target.tagName !== 'TEXTAREA') return;
+        if (!target.closest('#blob-sidebar-wrap')) return;
+        var btn = findGenBtn();
+        if (!btn) return;
+        e.preventDefault();
+        e.stopPropagation();
+        btn.click();
+    }, true);
 
     // 2) Loading banner is now inline in header — no overlay positioning needed
 
@@ -279,8 +290,7 @@ BLOB_JS_HOOK = """
     }
     highlightActiveFamily();
     setInterval(highlightActiveFamily, 200);
-})();
-</script>
+}
 """
 
 
@@ -1453,6 +1463,7 @@ footer { display: none !important; }
 _engine = None
 _dd_engine = None
 _st_engine = None
+_upscale_engine = None
 _current_family = "vqgan"
 _last_meta = {}
 _load = {
@@ -1828,6 +1839,42 @@ def _dispose_st_engine():
     _st_engine = None
 
 
+def _dispose_upscale_engine():
+    global _upscale_engine
+    if _upscale_engine is None:
+        return
+    try:
+        _upscale_engine._model = None
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as exc:
+        blobvision_log.append("Upscale dispose: " + str(exc))
+    _upscale_engine = None
+
+
+def get_upscale_engine():
+    global _upscale_engine
+    if _upscale_engine is None:
+        device = "cpu" if _aux_cpu_during_warmup() else None
+        _upscale_engine = UpscaleEngine(device=device)
+    return _upscale_engine
+
+
+def _maybe_upscale(image_path, enabled):
+    """Applied automatically at the end of generation when the sidebar's Upscale
+    checkbox is on — a failed upscale shouldn't lose an otherwise-good generation,
+    so it logs and falls back to the un-upscaled result instead of raising."""
+    if not enabled or not image_path or not os.path.isfile(image_path):
+        return image_path
+    blobvision_log.append("Upscale x2: " + os.path.basename(image_path))
+    try:
+        return get_upscale_engine().upscale(image_path, on_progress=blobvision_log.append)
+    except Exception as exc:
+        blobvision_log.append("Upscale skipped (failed): " + str(exc))
+        return image_path
+
+
 def get_dd_engine():
     global _dd_engine
     if _dd_engine is None:
@@ -1941,8 +1988,8 @@ def _prompt_seed(prompt, seed):
 
 
 def do_deepdream_generate(
-    dd_prompt, dd_negative_prompt, aspect, dd_steps, dd_octaves, dd_layer,
-    dd_fidelity, dd_sketch_upload, random_seed, seed_value, reuse_last_seed,
+    dd_prompt, dd_negative_prompt, aspect, dd_intensity, dd_layer,
+    dd_sketch_upload, random_seed, seed_value, reuse_last_seed, dd_upscale,
 ):
     global _last_meta
     empty_sketch = gr.update()
@@ -1996,13 +2043,14 @@ def do_deepdream_generate(
             blobvision_log.append(
                 "No prompt, no image — dreaming from random noise."
             )
-        preserve = float(dd_fidelity) if engine_mode in ("redux", "img2img") else None
+        steps, octaves, preserve_from_intensity = dd_intensity_to_params(dd_intensity)
+        preserve = preserve_from_intensity if engine_mode in ("redux", "img2img") else None
         result = get_dd_engine().generate(
             mode=engine_mode,
             width=width,
             height=height,
-            steps=int(dd_steps),
-            octaves=int(dd_octaves),
+            steps=steps,
+            octaves=octaves,
             layer=dd_layer,
             init_image_path=init_path,
             seed=seed,
@@ -2016,9 +2064,10 @@ def do_deepdream_generate(
         raise gr.Error("DeepDream failed: " + str(exc)) from exc
     _last_meta = dict(result.metadata)
     meta_text = json.dumps(result.metadata, ensure_ascii=False)
+    output_path = _maybe_upscale(result.output_path, dd_upscale)
     return (
         poll_banner(),
-        result.output_path,
+        output_path,
         sketch_out if init_path and engine_mode == "redux" else empty_sketch,
         int(result.seed),
         meta_text,
@@ -2033,30 +2082,98 @@ def on_st_content_upload(content_image):
     return gr.update(value=ASPECT_CUSTOM)
 
 
+def on_st_preset_change(preset_key):
+    is_classic = not preset_key
+    if is_classic:
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(visible=True),
+            ST_MODE_BLURB,
+            gr.update(visible=False),
+            gr.update(),
+        )
+    preset = STYLE_PRESETS.get(preset_key, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
+    return (
+        gr.update(visible=False),
+        gr.update(visible=True),
+        gr.update(visible=False),
+        ST_SDXL_MODE_BLURB,
+        gr.update(visible=preset_key == "custom"),
+        gr.update(value=preset["strength"]),
+    )
+
+
 def do_style_generate(
     st_aspect, st_style_image, st_style_strength, st_content_weight, st_steps,
-    st_content_image, random_seed, seed_value, reuse_last_seed,
+    st_preset, st_preset_custom_prompt, st_preset_strength,
+    st_content_image, random_seed, seed_value, reuse_last_seed, st_upscale,
 ):
     global _last_meta
+    if st_content_image is None:
+        blobvision_log.append("Error: upload a content image on the right.")
+        raise gr.Error("Upload a content image on the right.")
+    seed = None
+    if reuse_last_seed and _last_meta.get("seed") is not None:
+        seed = int(_last_meta["seed"])
+    elif not random_seed:
+        seed = int(seed_value)
+    else:
+        seed = random.randint(0, 2**31 - 1)
+
+    if st_preset:
+        if not _sdxl_ready():
+            _notify_sdxl_loading()
+            raise gr.Error("SDXL still loading — wait for the banner to clear.")
+        preset = STYLE_PRESETS.get(st_preset, STYLE_PRESETS[DEFAULT_STYLE_PRESET])
+        prompt = (st_preset_custom_prompt or "").strip() if st_preset == "custom" else preset["prompt"]
+        if not prompt:
+            blobvision_log.append("Error: enter a custom prompt for the Custom preset.")
+            raise gr.Error("Enter a custom prompt for the Custom preset.")
+        try:
+            width, height = resolve_ui_output_size(st_aspect, st_content_image)
+            out_dir = os.path.join(get_st_engine().output_dir, "uploads")
+            os.makedirs(out_dir, exist_ok=True)
+            content_path = os.path.join(out_dir, uuid.uuid4().hex + "_content.png")
+            st_content_image.save(content_path)
+            engine = get_engine(require_sdxl=True)
+            result = engine.generate_style_preset(
+                image_path=content_path,
+                prompt=prompt,
+                strength=float(st_preset_strength),
+                seed=seed,
+                negative_prompt=preset.get("negative_prompt"),
+                steps=preset.get("steps", STYLE_PRESET_STEPS),
+                width=width,
+                height=height,
+                output_dir=get_st_engine().output_dir,
+                on_progress=blobvision_log.append,
+            )
+        except gr.Error:
+            raise
+        except Exception as exc:
+            blobvision_log.append("SDXL restyle error: " + str(exc))
+            raise gr.Error("SDXL restyle failed: " + str(exc)) from exc
+        _last_meta = dict(result.metadata)
+        meta_text = json.dumps(result.metadata, ensure_ascii=False)
+        output_path = _maybe_upscale(result.output_path, st_upscale)
+        return (
+            poll_banner(),
+            output_path,
+            int(result.seed),
+            meta_text,
+            _gen_end(),
+        )
+
     if not _style_weights_ready():
         _load["blink_until"] = time.time() + 2.0
         blobvision_log.append("Modèle VGG19 manquant — clique « Install model » (header ou sidebar).")
         raise gr.Error("VGG19 model missing — click Install model.")
-    if st_content_image is None:
-        blobvision_log.append("Error: upload a content image on the right.")
-        raise gr.Error("Upload a content image on the right.")
     if st_style_image is None:
         blobvision_log.append("Error: upload a style reference in the sidebar.")
         raise gr.Error("Upload a style reference in the sidebar.")
     try:
         width, height = resolve_ui_output_size(st_aspect, st_content_image)
-        seed = None
-        if reuse_last_seed and _last_meta.get("seed") is not None:
-            seed = int(_last_meta["seed"])
-        elif not random_seed:
-            seed = int(seed_value)
-        else:
-            seed = random.randint(0, 2**31 - 1)
         st = get_st_engine()
         upload_dir = os.path.join(st.output_dir, "uploads")
         os.makedirs(upload_dir, exist_ok=True)
@@ -2080,9 +2197,10 @@ def do_style_generate(
         raise gr.Error("Style transfer failed: " + str(exc)) from exc
     _last_meta = dict(result.metadata)
     meta_text = json.dumps(result.metadata, ensure_ascii=False)
+    output_path = _maybe_upscale(result.output_path, st_upscale)
     return (
         poll_banner(),
-        result.output_path,
+        output_path,
         int(result.seed),
         meta_text,
         _gen_end(),
@@ -2119,12 +2237,11 @@ def _warmup_worker():
             on_stage=_on_stage,
             on_vqgan_ready=_on_vqgan_ready,
             on_sdxl_ready=_on_sdxl_ready,
+            get_current_family=lambda: _current_family,
         )
         _load["ready"] = True
-        _load["vqgan_ready"] = True
-        _load["sdxl_ready"] = True
         _load["stage"] = "Ready"
-        print("Models ready — SDXL + VQGAN loaded.", flush=True)
+        print("Models ready (SDXL loaded; VQGAN may still be finishing in background).", flush=True)
         if _engine is not None and not os.environ.get("BLOBVISION_SKIP_WARMUP", "").strip().lower() in ("1", "true", "yes"):
             threading.Thread(target=_bg_sketch_warmup, daemon=True).start()
     except Exception as exc:
@@ -2353,6 +2470,7 @@ def do_generate(
     mode, prompt, negative_prompt, init_image, sketch_upload, video_input, aspect,
     iterations_slider, denoise, random_seed, seed_value, reuse_last_seed,
     video_encode_range, video_encode_from, video_encode_to, video_frame_step,
+    upscale_x2,
 ):
     global _last_meta, _generating
     blobvision_log.append("DEGENERATE — mode={}.".format(mode))
@@ -2514,9 +2632,10 @@ def do_generate(
     _last_meta = dict(result.metadata)
     meta_text = json.dumps(result.metadata, ensure_ascii=False)
     sketch_out = result.sketch_path if result.sketch_path and os.path.isfile(result.sketch_path) else None
+    output_path = _maybe_upscale(result.output_path, upscale_x2)
     return (
         poll_banner(),
-        result.output_path, sketch_out, int(result.seed), meta_text,
+        output_path, sketch_out, int(result.seed), meta_text,
         gr.update(value=None),
         _gen_end(),
     )
@@ -2535,6 +2654,7 @@ def disconnect_server():
     _dispose_engine()
     _dispose_dd_engine()
     _dispose_st_engine()
+    _dispose_upscale_engine()
     _load["ready"] = False
     _load["vqgan_ready"] = False
     _load["sdxl_ready"] = False
@@ -2667,6 +2787,10 @@ def build_ui():
                             info="Closer to 0 = closer to init",
                             elem_classes=["blob-compact-slider"],
                         )
+                        upscale_x2 = gr.Checkbox(
+                            value=False,
+                            label="Upscale output x2 (Real-ESRGAN)",
+                        )
                         video_frame_step = gr.Radio(
                             VQ_VIDEO_FRAME_STEP_CHOICES,
                             value=DEFAULT_VQ_VIDEO_FRAME_STEP,
@@ -2729,23 +2853,15 @@ def build_ui():
                             label="Inception layer",
                             info="mixed5b = faces; mixed6a = best default; mixed7 = abstract.",
                         )
-                        dd_fidelity = gr.Slider(
-                            0.0, 1.0, value=DD_DEFAULT_PRESERVE, step=0.05, precision=2,
-                            label="Source fidelity",
-                            info="0 = classic DeepDream (eyes, critters in the shapes). Higher = closer to the upload.",
+                        dd_intensity = gr.Slider(
+                            0, 100, value=DD_DEFAULT_INTENSITY, step=5, precision=0,
+                            label="Intensity",
+                            info="How hard to dream. Low = your image, barely touched. High = fully hallucinated.",
                             elem_classes=["blob-compact-slider"],
                         )
-                        dd_steps = gr.Slider(
-                            10, 200, value=DD_DEFAULT_STEPS, step=5, precision=0,
-                            label="Dream steps",
-                            info="Gradient ascent iterations per octave.",
-                            elem_classes=["blob-compact-slider"],
-                        )
-                        dd_octaves = gr.Slider(
-                            1, 5, value=DD_DEFAULT_OCTAVES, step=1, precision=0,
-                            label="Octaves",
-                            info="Multi-scale dreaming (more = trippier, slower).",
-                            elem_classes=["blob-compact-slider"],
+                        dd_upscale = gr.Checkbox(
+                            value=False,
+                            label="Upscale output x2 (Real-ESRGAN)",
                         )
 
                     with gr.Group(visible=False, elem_id="style-sidebar-panel") as style_sidebar_panel:
@@ -2768,23 +2884,41 @@ def build_ui():
                             label="Format",
                             info=ASPECT_FORMAT_INFO,
                         )
-                        st_style_strength = gr.Slider(
-                            0.1, 2.0, value=ST_DEFAULT_STYLE_STRENGTH, step=0.05, precision=2,
-                            label="Style strength",
-                            info="Higher = more of the style reference texture and palette.",
-                            elem_classes=["blob-compact-slider"],
-                        )
-                        st_content_weight = gr.Slider(
-                            0.1, 2.0, value=ST_DEFAULT_CONTENT_WEIGHT, step=0.05, precision=2,
-                            label="Content fidelity",
-                            info="Higher = keeps more of the content photo structure.",
-                            elem_classes=["blob-compact-slider"],
-                        )
-                        st_steps = gr.Slider(
-                            50, 500, value=ST_DEFAULT_STEPS, step=10, precision=0,
-                            label="Steps",
-                            info="Optimization iterations (more = slower, often cleaner).",
-                            elem_classes=["blob-compact-slider"],
+                        with gr.Group(visible=True) as style_classic_controls:
+                            st_style_strength = gr.Slider(
+                                0.1, 2.0, value=ST_DEFAULT_STYLE_STRENGTH, step=0.05, precision=2,
+                                label="Style strength",
+                                info="Higher = more of the style reference texture and palette.",
+                                elem_classes=["blob-compact-slider"],
+                            )
+                            st_content_weight = gr.Slider(
+                                0.1, 2.0, value=ST_DEFAULT_CONTENT_WEIGHT, step=0.05, precision=2,
+                                label="Content fidelity",
+                                info="Higher = keeps more of the content photo structure.",
+                                elem_classes=["blob-compact-slider"],
+                            )
+                            st_steps = gr.Slider(
+                                50, 500, value=ST_DEFAULT_STEPS, step=10, precision=0,
+                                label="Steps",
+                                info="Optimization iterations (more = slower, often cleaner).",
+                                elem_classes=["blob-compact-slider"],
+                            )
+                        with gr.Group(visible=False) as style_preset_controls:
+                            st_preset_custom_prompt = gr.Textbox(
+                                label="Custom prompt",
+                                visible=False,
+                                placeholder="Describe the style to restyle into...",
+                            )
+                            st_preset_strength = gr.Slider(
+                                0.1, 0.9, value=STYLE_PRESETS[DEFAULT_STYLE_PRESET]["strength"],
+                                step=0.05, precision=2,
+                                label="Strength",
+                                info="Higher = more transformed, lower = closer to your photo.",
+                                elem_classes=["blob-compact-slider"],
+                            )
+                        st_upscale = gr.Checkbox(
+                            value=False,
+                            label="Upscale output x2 (Real-ESRGAN)",
                         )
 
             with gr.Column(scale=8, elem_id="blob-preview"):
@@ -2795,7 +2929,7 @@ def build_ui():
                                 label="Output", type="filepath",
                                 height=PREVIEW_SIZE, scale=1,
                                 sources=[], interactive=False,
-                                buttons=["download"], elem_id="blob-output-image",
+                                buttons=["download", "fullscreen"], elem_id="blob-output-image",
                                 placeholder=None, show_label=True,
                             )
                             video_output = gr.Video(
@@ -2815,7 +2949,7 @@ def build_ui():
                                 height=PREVIEW_SIZE,
                                 sources=[],
                                 interactive=False,
-                                buttons=["download"],
+                                buttons=["download", "fullscreen"],
                                 elem_id="blob-dd-output-image",
                             )
                             dd_use_init_btn = gr.Button(
@@ -2829,7 +2963,7 @@ def build_ui():
                                 height=PREVIEW_SIZE,
                                 sources=[],
                                 interactive=False,
-                                buttons=["download"],
+                                buttons=["download", "fullscreen"],
                                 elem_id="blob-st-output-image",
                             )
                         gallery_btn = gr.Button("Open gallery", size="sm", elem_id="blob-gallery-btn")
@@ -2843,7 +2977,7 @@ def build_ui():
                                 type="filepath", height=260,
                                 scale=1, visible=True,
                                 sources=["upload"], interactive=True,
-                                buttons=["download", "clear"],
+                                buttons=["download", "clear", "fullscreen"],
                                 placeholder="Empty = SDXL sketch. Drop image = img2img.",
                                 elem_id="blob-sketch-image",
                             )
@@ -2855,7 +2989,7 @@ def build_ui():
                                 scale=1,
                                 sources=["upload"],
                                 interactive=True,
-                                buttons=["download", "clear"],
+                                buttons=["download", "clear", "fullscreen"],
                                 placeholder="Drop image = img2img.",
                                 elem_id="blob-source-image",
                             )
@@ -2873,7 +3007,7 @@ def build_ui():
                                 visible=True,
                                 sources=["upload"],
                                 interactive=True,
-                                buttons=["download", "clear"],
+                                buttons=["download", "clear", "fullscreen"],
                                 placeholder="Empty = SDXL sketch. Drop image = img2img.",
                                 elem_id="blob-dd-sketch-image",
                             )
@@ -2884,6 +3018,7 @@ def build_ui():
                                 height=260,
                                 sources=["upload"],
                                 interactive=True,
+                                buttons=["download", "clear", "fullscreen"],
                                 elem_id="blob-st-style-image",
                             )
                             st_content_image = gr.Image(
@@ -2892,7 +3027,17 @@ def build_ui():
                                 height=260,
                                 sources=["upload"],
                                 interactive=True,
+                                buttons=["download", "clear", "fullscreen"],
                                 elem_id="blob-st-content-image",
+                            )
+                            st_preset = gr.Dropdown(
+                                choices=[(NO_PRESET_LABEL, NO_PRESET_VALUE)]
+                                + [(v["label"], k) for k, v in STYLE_PRESETS.items()],
+                                value=NO_PRESET_VALUE,
+                                label="SDXL preset",
+                                info="Pick a preset to restyle with SDXL Turbo. Leave on "
+                                     "\"" + NO_PRESET_LABEL + "\" for classic VGG19 style transfer.",
+                                elem_id="blob-st-preset-dropdown",
                             )
 
                         with gr.Row(elem_classes=["blob-preview-footer"]):
@@ -2982,6 +3127,7 @@ def build_ui():
                 mode, prompt, negative_prompt, init_image, sketch, video_input, aspect,
                 iterations, denoise, random_seed, seed_value, reuse_last_seed,
                 video_encode_range, video_encode_from, video_encode_to, video_frame_step,
+                upscale_x2,
             ],
             vqgan_gen_outputs,
         )
@@ -2999,13 +3145,20 @@ def build_ui():
             do_deepdream_generate,
             [
                 dd_prompt, dd_negative_prompt, dd_aspect,
-                dd_steps, dd_octaves, dd_layer, dd_fidelity, dd_sketch,
-                random_seed, seed_value, reuse_last_seed,
+                dd_intensity, dd_layer, dd_sketch,
+                random_seed, seed_value, reuse_last_seed, dd_upscale,
             ],
             dd_gen_outputs,
         )
         dd_gen.then(None, None, None, js=SIDEBAR_BUSY_OFF_JS)
         st_content_image.change(on_st_content_upload, st_content_image, st_aspect)
+        st_preset.change(
+            on_st_preset_change, st_preset,
+            [
+                style_classic_controls, style_preset_controls, st_style_image, st_mode_help,
+                st_preset_custom_prompt, st_preset_strength,
+            ],
+        )
         st_gen_outputs = [load_banner, st_output, seed_out, meta_out, abort_btn]
         st_gen = st_generate_btn.click(
             _gen_start, None, abort_btn, js=SIDEBAR_BUSY_ON_JS,
@@ -3013,7 +3166,8 @@ def build_ui():
             do_style_generate,
             [
                 st_aspect, st_style_image, st_style_strength, st_content_weight, st_steps,
-                st_content_image, random_seed, seed_value, reuse_last_seed,
+                st_preset, st_preset_custom_prompt, st_preset_strength,
+                st_content_image, random_seed, seed_value, reuse_last_seed, st_upscale,
             ],
             st_gen_outputs,
         )
@@ -3075,7 +3229,7 @@ def build_ui():
         demo.load(poll_style_install_btn, None, [install_style_btn, st_install_models_btn])
         demo.load(poll_codecs_install_btn, None, install_codecs_btn)
         demo.load(None, None, None, js=CONSOLE_SCROLL_JS)
-        gr.HTML(BLOB_JS_HOOK, elem_id="blob-js-hook")
+        demo.load(None, None, None, js=BLOB_JS_HOOK)
 
     return demo
 

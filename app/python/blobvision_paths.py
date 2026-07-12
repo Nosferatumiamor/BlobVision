@@ -26,6 +26,9 @@ OPENCLIP_ROOT = os.path.join(MODELS_ROOT, "open_clip")
 HF_CACHE_ROOT = os.path.join(MODELS_ROOT, "hf_cache")
 STYLE_WEIGHTS_DIR = os.path.join(MODELS_ROOT, "style-transfer")
 STYLE_WEIGHTS_PATH = os.path.join(STYLE_WEIGHTS_DIR, "vgg19_imagenet.pth")
+UPSCALE_MODEL_DIR = os.path.join(MODELS_ROOT, "upscale")
+UPSCALE_MODEL_PATH = os.path.join(UPSCALE_MODEL_DIR, "RealESRGAN_x2plus.pth")
+CAPTION_MODEL_DIR = os.path.join(MODELS_ROOT, "caption")
 
 VQGAN_CONFIG_NAME = "vqgan_imagenet_f16_16384.yaml"
 VQGAN_CHECKPOINT_NAME = "vqgan_imagenet_f16_16384.ckpt"
@@ -62,6 +65,8 @@ def ensure_layout():
     os.makedirs(OPENCLIP_ROOT, exist_ok=True)
     os.makedirs(HF_CACHE_ROOT, exist_ok=True)
     os.makedirs(STYLE_WEIGHTS_DIR, exist_ok=True)
+    os.makedirs(UPSCALE_MODEL_DIR, exist_ok=True)
+    os.makedirs(CAPTION_MODEL_DIR, exist_ok=True)
     for sub in ("vqgan", "deepdream", "style-transfer"):
         os.makedirs(os.path.join(OUTPUTS_ROOT, sub), exist_ok=True)
 
@@ -157,6 +162,14 @@ def sdxl_model_dir():
 
 def style_weights_path():
     return _pick_file(STYLE_WEIGHTS_PATH, _LEGACY_STYLE_WEIGHTS)
+
+
+def upscale_model_path():
+    return UPSCALE_MODEL_PATH
+
+
+def caption_model_dir():
+    return CAPTION_MODEL_DIR
 
 
 def vqgan_output_dir():
