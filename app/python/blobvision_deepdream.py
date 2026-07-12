@@ -1,4 +1,11 @@
-"""DeepDream generation engine for BlobVision (InceptionV3)."""
+"""DeepDream generation engine for BlobVision (GoogLeNet / Inception v1).
+
+Uses torchvision's GoogLeNet rather than Inception v3: it's architecturally the same
+family (Inception v1) as the Caffe BVLC GoogLeNet the original Google DeepDream blog
+post ran on, so the same layer depths reproduce the classic eyes/dogs/birds look —
+Inception v3's deeper, factorized-convolution filters don't hallucinate the same
+iconography even at "equivalent" layer names.
+"""
 import os
 import random
 import threading
@@ -15,18 +22,59 @@ DEFAULT_STEPS = 40
 DEFAULT_OCTAVES = 4
 DEFAULT_LAYER = "mixed6a"
 OCTAVE_SCALE = 1.4
-STEP_SIZE = 0.01
-STEP_SIZE_IMG2IMG = 0.009
-STEP_SIZE_REDUX = 0.012
+STEP_SIZE = 0.025
+STEP_SIZE_IMG2IMG = 0.03
+STEP_SIZE_REDUX = 0.016
 PRESERVE_IMG2IMG = 0.45
 PRESERVE_REDUX = 0.45
 GRAD_BLUR_RADIUS = 0
 
+# Random pixel-shift applied before each gradient step and undone after (the classic
+# DeepDream "jitter" trick). Without it, the conv-net's receptive-field grid stays
+# perfectly aligned with the image on every step, which shows up as a regular tiled
+# grid pattern instead of organic hallucinated detail. Sized relative to the current
+# octave's resolution so it scales from small to large octaves.
+JITTER_FRACTION = 0.06
+JITTER_MIN_PX = 4
+JITTER_MAX_PX = 32
+
+# Floor for the smallest octave in the pyramid (see _run_octaves) — stops shrinking well
+# before the image degenerates into a meaningless handful of pixels.
+MIN_OCTAVE_PX = 200
+
+# Keys are the stable identifiers the UI radio button uses (unchanged across the
+# InceptionV3 -> GoogLeNet swap); values are GoogLeNet module names. inception4c is the
+# single most iconic DeepDream layer (the classic dog-slug/eyes look from the original
+# blog post); 3b/5a bracket it for a more textural vs. more abstract/whole-object feel.
 INCEPTION_LAYERS = {
-    "mixed5b": "Mixed_5b",
-    "mixed6a": "Mixed_6a",
-    "mixed7": "Mixed_7c",
+    "mixed5b": "inception3b",
+    "mixed6a": "inception4c",
+    "mixed7": "inception5a",
 }
+
+# Single-dial intensity control (0..100) for img2img/redux. Steps, octaves, and preserve
+# all need to move together to go from "barely touched" to "fully hallucinated" — tuning
+# them as 3 separate sliders makes it easy to land on combinations that look like noise
+# (e.g. many octaves + low preserve) or do nothing (few steps + high preserve) without any
+# visual cue why. These anchors are hand-picked from visual comparison, not derived:
+# 50 is the validated "recognizable source + a few strong creatures" sweet spot.
+INTENSITY_ANCHORS = {
+    0.0: {"steps": 10, "octaves": 1, "preserve": 0.70},
+    0.5: {"steps": 16, "octaves": 2, "preserve": 0.45},
+    1.0: {"steps": 24, "octaves": 3, "preserve": 0.00},
+}
+
+
+def intensity_to_params(intensity):
+    """Map a 0..100 'how hard to dream' dial to (steps, octaves, preserve)."""
+    t = max(0.0, min(1.0, float(intensity) / 100.0))
+    lo, hi = (0.0, 0.5) if t <= 0.5 else (0.5, 1.0)
+    local = 0.0 if hi == lo else (t - lo) / (hi - lo)
+    a, b = INTENSITY_ANCHORS[lo], INTENSITY_ANCHORS[hi]
+    steps = round(a["steps"] + local * (b["steps"] - a["steps"]))
+    preserve = round(a["preserve"] + local * (b["preserve"] - a["preserve"]), 2)
+    octaves = max(1, min(3, round(1 + t * 2)))
+    return int(steps), int(octaves), float(preserve)
 
 
 @dataclass
@@ -55,8 +103,8 @@ class DeepDreamEngine:
             return self._model
         from torchvision import models
 
-        weights = models.Inception_V3_Weights.IMAGENET1K_V1
-        model = models.inception_v3(weights=weights)
+        weights = models.GoogLeNet_Weights.IMAGENET1K_V1
+        model = models.googlenet(weights=weights)
         model.aux_logits = False
         model.eval()
         for param in model.parameters():
@@ -114,12 +162,12 @@ class DeepDreamEngine:
 
     def _dream_once(
         self, image, layer_module, steps, on_progress=None, step_size=None,
-        use_mean_loss=False, grad_blur=0,
+        use_mean_loss=False, grad_blur=0, jitter=0,
     ):
         import torch
 
         model = self._load_model()
-        img = image.detach().clone().requires_grad_(True)
+        img = image.detach().clone()
         captured = {}
 
         def hook(_module, _inputs, output):
@@ -128,9 +176,13 @@ class DeepDreamEngine:
         handle = layer_module.register_forward_hook(hook)
         try:
             for step in range(int(steps)):
+                shift_h = shift_w = 0
+                if jitter > 0:
+                    shift_h = random.randint(-int(jitter), int(jitter))
+                    shift_w = random.randint(-int(jitter), int(jitter))
+                    img = torch.roll(img, shifts=(shift_h, shift_w), dims=(2, 3))
+                img = img.detach().requires_grad_(True)
                 model.zero_grad(set_to_none=True)
-                if img.grad is not None:
-                    img.grad.zero_()
                 out = model(self._preprocess(img))
                 if hasattr(out, "logits"):
                     _ = out.logits
@@ -145,8 +197,11 @@ class DeepDreamEngine:
                 if grad_blur > 0:
                     grad = self._blur_grad(grad, radius=grad_blur)
                 with torch.no_grad():
-                    img.add_(step_sz * grad)
+                    img = img + step_sz * grad
                     img.clamp_(0.0, 1.0)
+                if shift_h or shift_w:
+                    img = torch.roll(img, shifts=(-shift_h, -shift_w), dims=(2, 3))
+                img = img.detach()
                 if on_progress and (step == 0 or step == int(steps) - 1 or step % max(1, int(steps) // 4) == 0):
                     on_progress("DeepDream step {}/{}".format(step + 1, int(steps)))
         finally:
@@ -155,35 +210,42 @@ class DeepDreamEngine:
 
     def _run_octaves(
         self, image, layer_module, steps, octaves, on_progress=None, step_size=None,
-        use_mean_loss=False, grad_blur=0,
+        use_mean_loss=False, grad_blur=0, jitter=True,
     ):
         import torch
         import torch.nn.functional as F
 
-        base_h, base_w = image.shape[2], image.shape[3]
+        target_h, target_w = image.shape[2], image.shape[3]
 
-        # Build octave pyramid going UP (larger scales) — matches original Google DeepDream
-        # Going up produces large features (dogs, faces) at high octaves,
-        # then refines with fine detail at lower octaves.
-        MAX_OCTAVE_PX = 900
+        # Build octave pyramid going DOWN from the requested/target resolution — this is
+        # what the original Google DeepDream actually does (shrink the input to get
+        # smaller octaves, dream smallest-to-largest, finish at the original size).
+        # Growing UP from the target instead (the previous approach here) means the
+        # network's fixed-pixel receptive field covers a shrinking fraction of the canvas
+        # as target resolution increases, so the same settings produce visibly weaker,
+        # finer-grained hallucination at higher output sizes. Shrinking down keeps the
+        # coarsest working scale in roughly the same absolute pixel range regardless of
+        # the requested output size, so large features (muzzles, eyes) stay proportionally
+        # consistent instead of diluting at high resolution.
         octave_bases = [image.clone()]
         for i in range(int(octaves) - 1):
-            new_h = min(int(base_h * (OCTAVE_SCALE ** (i + 1))), MAX_OCTAVE_PX)
-            new_w = min(int(base_w * (OCTAVE_SCALE ** (i + 1))), MAX_OCTAVE_PX)
-            if new_h <= octave_bases[-1].shape[2] and new_w <= octave_bases[-1].shape[3]:
+            prev = octave_bases[-1]
+            new_h = max(MIN_OCTAVE_PX, int(prev.shape[2] / OCTAVE_SCALE))
+            new_w = max(MIN_OCTAVE_PX, int(prev.shape[3] / OCTAVE_SCALE))
+            if new_h >= prev.shape[2] and new_w >= prev.shape[3]:
                 break
-            up = F.interpolate(
-                octave_bases[-1], size=(new_h, new_w),
+            down = F.interpolate(
+                prev, size=(new_h, new_w),
                 mode="bilinear", align_corners=False,
             )
-            octave_bases.append(up)
+            octave_bases.append(down)
 
         actual_octaves = len(octave_bases)
 
-        # Start with zero detail at the largest scale
+        # Start with zero detail at the smallest scale
         detail = torch.zeros_like(octave_bases[-1])
 
-        # Process from LARGEST to SMALLEST
+        # Process from SMALLEST to LARGEST (coarse features first, then refine)
         dreamed = None
         for octave in range(actual_octaves):
             idx = actual_octaves - 1 - octave
@@ -199,16 +261,22 @@ class DeepDreamEngine:
                 on_progress("Octave {}/{} ({}x{})".format(
                     octave + 1, actual_octaves, base.shape[3], base.shape[2]))
 
+            octave_jitter = 0
+            if jitter:
+                octave_jitter = int(min(base.shape[2], base.shape[3]) * JITTER_FRACTION)
+                octave_jitter = max(JITTER_MIN_PX, min(JITTER_MAX_PX, octave_jitter))
+
             dreamed = self._dream_once(
                 base + detail, layer_module, steps, on_progress=on_progress,
                 step_size=step_size, use_mean_loss=use_mean_loss, grad_blur=grad_blur,
+                jitter=octave_jitter,
             )
             detail = dreamed - base
 
-        # detail is now at base scale — result = original + accumulated multi-scale detail
-        if detail.shape[2:] != (base_h, base_w):
+        # detail is now at target scale — result = original + accumulated multi-scale detail
+        if detail.shape[2:] != (target_h, target_w):
             detail = F.interpolate(
-                detail, size=(base_h, base_w),
+                detail, size=(target_h, target_w),
                 mode="bilinear", align_corners=False,
             )
         return image + detail
@@ -235,13 +303,13 @@ class DeepDreamEngine:
         if seed is None:
             seed = random.randint(0, 2**31 - 1)
         if on_progress:
-            on_progress("Loading InceptionV3...")
+            on_progress("Loading GoogLeNet...")
         layer_module = self._layer_module(layer)
         if mode == "redux":
             base_step = STEP_SIZE_REDUX
             if preserve is None:
                 preserve = PRESERVE_REDUX
-            use_mean_loss = True
+            use_mean_loss = False
             grad_blur = 0
         elif mode == "img2img":
             base_step = STEP_SIZE_IMG2IMG
