@@ -1015,6 +1015,20 @@ select {
   cursor: pointer;
 }
 
+.sam-color-swatch {
+  width: 1.8rem;
+  height: 1.8rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.sam-color-swatch.active {
+  border-color: var(--fg);
+  box-shadow: 0 0 0 2px var(--panel), 0 0 0 3px var(--fg);
+}
+
 
 /* --- SAM2 magic-wand overlay: bigger click target + the only place
    Soften/Expand-shrink/Invert live (see the redesign notes in main.ts) --- */

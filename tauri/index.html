@@ -475,7 +475,12 @@
                 <div class="checkbox-row">
                   <label class="checkbox-inline"><input type="radio" name="sam-cut-mode" value="alpha" checked /> Alpha</label>
                   <label class="checkbox-inline"><input type="radio" name="sam-cut-mode" value="color" /> Color</label>
-                  <input id="sam-cut-color" type="color" value="#00ff00" />
+                </div>
+                <div class="checkbox-row" id="sam-cut-color-row" hidden>
+                  <button type="button" class="sam-color-swatch active" data-color="#00ff00" style="background:#00ff00" title="Green"></button>
+                  <button type="button" class="sam-color-swatch" data-color="#0000ff" style="background:#0000ff" title="Blue"></button>
+                  <button type="button" class="sam-color-swatch" data-color="#ff2d95" style="background:#ff2d95" title="Pink"></button>
+                  <input id="sam-cut-color" type="color" value="#00ff00" title="Custom color" />
                 </div>
                 <div class="checkbox-row">
                   <button id="sam-cut-btn" type="button" disabled>Cut</button>
