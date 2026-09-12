@@ -616,9 +616,24 @@ const MODEL_CHECKBOXES: Record<ModelKey, HTMLInputElement> = {
 // None of SDXL Turbo / VQGAN+CLIP / Style Transfer's VGG19 ship with the
 // app or download automatically (main.rs forces HF_HUB_OFFLINE for normal
 // operation — see blobvision_engine.enable_hub_downloads) — a fresh install
-// has all three missing. Checked once right after the engine becomes
-// reachable; re-checked after an install run so the panel clears itself
-// once everything's actually in place, instead of requiring a restart.
+// has all three missing. Cached here so startStagedWarmup()/switchFamily()
+// can skip a doomed warmup call instead of eating an avoidable error — see
+// familyModelsReady(). Checked once right after the engine becomes
+// reachable, and again after any install run.
+let modelsStatusCache: Record<ModelKey, { ready: boolean }> | null = null;
+
+// Which gated models a family's OWN warmup needs — used to decide whether
+// to even attempt it. DeepDream isn't listed: its GoogLeNet weights come
+// from torchvision's own hub, unaffected by the HF_HUB_OFFLINE/
+// TRANSFORMERS_OFFLINE the Rust shell forces (those only gate
+// huggingface_hub-based fetches), so it always just works.
+function familyModelsReady(family: Family): boolean {
+  if (!modelsStatusCache) return true; // unknown — don't block on a fluke
+  if (family === "vqgan") return modelsStatusCache.vqgan.ready;
+  if (family === "style") return modelsStatusCache.style.ready;
+  return true;
+}
+
 async function refreshModelsInstallPanel(): Promise<boolean> {
   let status: Record<ModelKey, { ready: boolean }>;
   try {
@@ -626,6 +641,7 @@ async function refreshModelsInstallPanel(): Promise<boolean> {
   } catch {
     return true; // can't tell — don't block startStagedWarmup on a fluke
   }
+  modelsStatusCache = status;
   const allReady = status.sdxl.ready && status.vqgan.ready && status.style.ready;
   modelsInstallPanelEl.hidden = allReady;
   (Object.keys(MODEL_CHECKBOXES) as ModelKey[]).forEach((key) => {
@@ -661,14 +677,20 @@ modelsInstallBtnEl.addEventListener("click", async () => {
     (Object.values(MODEL_CHECKBOXES) as HTMLInputElement[]).forEach((cb) => (cb.disabled = false));
     return;
   }
+  // Tracks only the targets THIS click actually requested — refreshModelsInstallPanel()'s
+  // own "allReady" means all three, which would never come true (and poll
+  // forever) if the user deliberately left one unchecked. The panel itself
+  // stays visible either way (driven independently by refreshModelsInstallPanel)
+  // so whatever's still missing remains fixable later.
   const poll = async () => {
-    const allReady = await refreshModelsInstallPanel();
+    await refreshModelsInstallPanel();
+    const requestedReady = targets.every((key) => modelsStatusCache![key].ready);
     modelsInstallBtnEl.disabled = false;
-    if (allReady) {
+    if (requestedReady) {
       modelsInstallStatusEl.hidden = true;
-      // Models that were missing when startStagedWarmup() first ran would
-      // have failed silently into an error status — now that they're here,
-      // retry rather than making the user relaunch the app.
+      // Missing models that were skipped when startStagedWarmup() first ran
+      // would have left engine-status stuck on an error — now that at least
+      // these are here, retry rather than making the user relaunch the app.
       startStagedWarmup();
       return;
     }
@@ -707,10 +729,21 @@ async function waitForEngine() {
 // so that would silently undo the SDXL warmup. /warmup/vqgan preloads
 // VQGAN's weights without touching which phase is active, leaving SDXL
 // resident.
+// /warmup/vqgan and /style/warmup both respond 200 with {ok:false, reason}
+// when their weights aren't installed rather than throwing (a clean,
+// expected outcome, not a server error) — has to be checked explicitly, or
+// ensureFamilyResident()'s callers would see a "successful" resident swap
+// that didn't actually load anything.
 async function loadFamily(family: Family) {
-  if (family === "vqgan") await fetchJson("/warmup/vqgan", { method: "POST" });
-  else if (family === "deepdream") await fetchJson("/deepdream/warmup", { method: "POST" });
-  else await fetchJson("/style/warmup", { method: "POST" });
+  if (family === "vqgan") {
+    const result = await fetchJson("/warmup/vqgan", { method: "POST" });
+    if (!result.ok) throw new Error(result.reason ?? "VQGAN+CLIP weights not installed.");
+  } else if (family === "deepdream") {
+    await fetchJson("/deepdream/warmup", { method: "POST" });
+  } else {
+    const result = await fetchJson("/style/warmup", { method: "POST" });
+    if (!result.ok) throw new Error(result.reason ?? "Style Transfer weights not installed.");
+  }
 }
 
 async function unloadFamily(family: Family) {
@@ -787,21 +820,42 @@ function dropStartupPriority() {
 }
 
 async function startStagedWarmup() {
-  try {
-    await fetchJson("/warmup/sdxl", { method: "POST" });
-  } catch (err) {
-    setEngineStatus("SDXL warmup failed: " + (err as Error).message, "status-error");
-    dropStartupPriority();
-    // Enabled even on failure: a broken warmup should surface as a clear
-    // "Generation failed: ..." from the actual generate call (existing
-    // error handling in onGenerate), not as a silently-stuck disabled
-    // button with no way to even attempt it or see why.
-    generateBtn.disabled = false;
-    return;
+  // Skip the call entirely rather than let it fail — with the weights
+  // missing, /warmup/sdxl returning {ok:false} promptly is strictly better
+  // than eating a round-trip (or, before the backend guard, a raw
+  // exception) just to learn what we already knew from /models/status. The
+  // models-install-panel (shown by refreshModelsInstallPanel, called right
+  // before this) is the actionable fix, so this only needs to log, not
+  // surface as an "error".
+  if (modelsStatusCache && !modelsStatusCache.sdxl.ready) {
+    setEngineStatus("SDXL Turbo not installed — see Download models below.", "status-error");
+  } else {
+    try {
+      await fetchJson("/warmup/sdxl", { method: "POST" });
+      setEngineStatus("SDXL ready — loading " + currentFamily + "...", "status-ok");
+    } catch (err) {
+      setEngineStatus("SDXL warmup failed: " + (err as Error).message, "status-error");
+      dropStartupPriority();
+      // Enabled even on failure: a broken warmup should surface as a clear
+      // "Generation failed: ..." from the actual generate call (existing
+      // error handling in onGenerate), not as a silently-stuck disabled
+      // button with no way to even attempt it or see why.
+      generateBtn.disabled = false;
+      return;
+    }
   }
-  setEngineStatus("SDXL ready — loading " + currentFamily + "...", "status-ok");
 
   const family = currentFamily;
+  if (!familyModelsReady(family)) {
+    // Same reasoning as the SDXL skip above — ensureFamilyResident() would
+    // just fail cleanly (backend guard) or throw (network/other), neither
+    // of which teaches the user anything the install panel doesn't already
+    // say. Generate stays disabled: there's genuinely no model to use.
+    setEngineStatus(family + " weights not installed — see Download models below.", "status-error");
+    dropStartupPriority();
+    updateOutputHint();
+    return;
+  }
   try {
     await ensureFamilyResident(family);
     setEngineStatus("Engine ready (SDXL + " + family + ")", "status-ok");

@@ -580,6 +580,8 @@ def warmup_sdxl():
     # this line is what's slow) — see the "[+Xs]" prefix from
     # _ElapsedStdout above.
     print("POST /warmup/sdxl received", flush=True)
+    if not sdxl_weights_status()["ready"]:
+        return {"ok": False, "reason": "SDXL Turbo weights not installed."}
     global _engine
     if _engine is None:
         _engine = BlobVisionEngine(keep_models=True)
@@ -607,6 +609,8 @@ def warmup_vqgan():
     off GPU instead of activating that phase, leaving SDXL resident.
     Returns as soon as the real weights are loaded — see
     _spawn_background_warmup for why run_vqgan_warmup doesn't block this."""
+    if not vqgan_family_status()["ready"]:
+        return {"ok": False, "reason": "VQGAN+CLIP weights not installed."}
     global _engine
     if _engine is None:
         _engine = BlobVisionEngine(keep_models=True)
