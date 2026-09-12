@@ -391,6 +391,8 @@ const samExpandValueEl = $<HTMLSpanElement>("#sam-expand-value");
 const samCutBtnEl = $<HTMLButtonElement>("#sam-cut-btn");
 const samKeepBtnEl = $<HTMLButtonElement>("#sam-keep-btn");
 const samCutColorEl = $<HTMLInputElement>("#sam-cut-color");
+const samCutColorRowEl = $<HTMLDivElement>("#sam-cut-color-row");
+const samColorSwatchBtns = document.querySelectorAll<HTMLButtonElement>(".sam-color-swatch");
 const samCutModeRadios = document.querySelectorAll<HTMLInputElement>('input[name="sam-cut-mode"]');
 const samExportCutBtnEl = $<HTMLButtonElement>("#sam-export-cut-btn");
 const seedValueEl = $<HTMLInputElement>("#seed-value");
@@ -4027,8 +4029,40 @@ samInvertBtnEl.addEventListener("click", () => {
 samCutBtnEl.addEventListener("click", () => void commitCutMask(false));
 samKeepBtnEl.addEventListener("click", () => void commitCutMask(true));
 samExportCutBtnEl.addEventListener("click", () => void exportCutFromOutput());
-samCutColorEl.addEventListener("input", renderSamMaskPreview);
-samCutModeRadios.forEach((radio) => radio.addEventListener("change", renderSamMaskPreview));
+
+// Highlights whichever preset swatch matches the color currently loaded in
+// the native picker — including after the picker itself is used directly,
+// so picking exactly green/blue/pink there still lights up the matching
+// preset instead of looking unrelated to it. No match (a genuinely custom
+// color) just leaves all three unlit; the native swatch already shows its
+// own color as feedback.
+function syncActiveSwatch() {
+  const current = samCutColorEl.value.toLowerCase();
+  samColorSwatchBtns.forEach((btn) => {
+    btn.classList.toggle("active", (btn.dataset.color || "").toLowerCase() === current);
+  });
+}
+
+function updateSamCutColorRowVisibility() {
+  const isColor = document.querySelector<HTMLInputElement>('input[name="sam-cut-mode"]:checked')?.value === "color";
+  samCutColorRowEl.hidden = !isColor;
+}
+
+samColorSwatchBtns.forEach((btn) => {
+  btn.addEventListener("click", () => {
+    samCutColorEl.value = btn.dataset.color || samCutColorEl.value;
+    syncActiveSwatch();
+    renderSamMaskPreview();
+  });
+});
+samCutColorEl.addEventListener("input", () => {
+  syncActiveSwatch();
+  renderSamMaskPreview();
+});
+samCutModeRadios.forEach((radio) => radio.addEventListener("change", () => {
+  updateSamCutColorRowVisibility();
+  renderSamMaskPreview();
+}));
 samShowMaskToggleEl.addEventListener("change", renderSamMaskPreview);
 // Small +/- badge cursor over the overlay canvas while Ctrl is held, so
 // add-vs-subtract is visible before you click, not just after (mirrors
