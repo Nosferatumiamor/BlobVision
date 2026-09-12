@@ -10,7 +10,20 @@ import { GRIMOIRE_PROMPT_CATEGORIES, GRIMOIRE_NEGATIVE_CATEGORIES, type Grimoire
 
 const API_BASE = "http://127.0.0.1:8420";
 const HEALTH_POLL_MS = 1000;
+// Used by ensureSamEmbedded's mid-session retry budget (the API is already
+// known to be up by then) — NOT by waitForEngine's initial wait, which needs
+// its own much longer budget; see ENGINE_STARTUP_TIMEOUT_MS below.
 const HEALTH_TIMEOUT_MS = 60000;
+// A fresh install (see main.rs's bootstrap_venv_if_missing / app/scripts/
+// bootstrap_venv.ps1) downloads a whole Python environment + PyTorch + ~150
+// packages before the API is reachable at all — comfortably 10-30 minutes,
+// vs. a normal launch's well-under-a-minute startup. Has to be generous
+// enough that a legitimate bootstrap still quietly finishing doesn't get
+// mistaken for a dead process and reported as permanently "unreachable".
+const ENGINE_STARTUP_TIMEOUT_MS = 40 * 60 * 1000;
+// Beyond ordinary launch time — first bootstrap is the likely explanation,
+// worth saying so instead of leaving "Checking engine..." looking stuck.
+const ENGINE_STARTUP_SLOW_HINT_MS = 60000;
 
 type Family = "vqgan" | "deepdream" | "style";
 
@@ -700,7 +713,9 @@ modelsInstallBtnEl.addEventListener("click", async () => {
 });
 
 async function waitForEngine() {
-  const deadline = Date.now() + HEALTH_TIMEOUT_MS;
+  const start = Date.now();
+  const deadline = start + ENGINE_STARTUP_TIMEOUT_MS;
+  let shownSlowHint = false;
   while (Date.now() < deadline) {
     try {
       await fetchJson("/health");
@@ -714,7 +729,19 @@ async function waitForEngine() {
       startStagedWarmup();
       return;
     } catch {
-      // API server not up yet (still spawning / installing deps) — keep polling.
+      // API server not up yet — ordinarily just normal spawn time (well
+      // under a minute), but on a genuinely fresh machine this covers a
+      // real multi-minute Python/PyTorch bootstrap running in the
+      // background (bootstrap_venv_if_missing in main.rs). Only escalate
+      // the message once we're past how long an ordinary launch ever
+      // takes, so this doesn't cry wolf on every normal startup.
+      if (!shownSlowHint && Date.now() - start > ENGINE_STARTUP_SLOW_HINT_MS) {
+        shownSlowHint = true;
+        setEngineStatus(
+          "Still starting… first launch can take up to ~30 min while a Python environment downloads.",
+          "status-pending",
+        );
+      }
     }
     await new Promise((r) => setTimeout(r, HEALTH_POLL_MS));
   }
