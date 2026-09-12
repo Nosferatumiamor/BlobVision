@@ -14,7 +14,12 @@
           <h1>BlobVision</h1>
           <p class="tagline">Retro AI Slop Emulator</p>
         </div>
-        <button id="studio-btn" type="button">Meme studio</button>
+        <!-- Hidden for v1: feature is functional (see app/python/blobvision_api.py's
+             /studio/save and /studio/upscale) but not yet polished enough to ship.
+             enterStudioMode() (tauri/src/main.ts) has no other entry point, so
+             hiding this button alone fully blocks access. Remove `hidden` to
+             re-enable once ready — no other code needs to change. -->
+        <button id="studio-btn" type="button" hidden>Meme studio</button>
       </div>
       <nav id="family-switcher">
         <button class="family-btn active" data-family="vqgan">VQGAN+CLIP</button>

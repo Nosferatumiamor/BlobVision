@@ -1048,18 +1048,6 @@ class BlobVisionEngine:
             on_vqgan_ready()
         stage("Ready")
 
-    def warmup_full(self, on_stage=None):
-        """Load VQGAN then SDXL (same as warmup_staged, no partial callbacks)."""
-        self.warmup_staged(on_stage=on_stage)
-
-    def park_all_for_aux(self, log=None):
-        """Park SDXL and VQGAN on CPU so auxiliary engines can use the GPU."""
-        with self._lock:
-            self._vram._park_vqgan(log)
-            self._vram._park_sketch(log)
-            self._vram.active = None
-            self._vram._gc_gpu()
-
     def shutdown(self):
         """Unload SDXL + VQGAN so Start can reload without restarting the UI."""
         import gc
@@ -1855,14 +1843,6 @@ class BlobVisionEngine:
                 "denoise_fidelity": denoise,
             },
         )
-
-    @staticmethod
-    def read_image_metadata(path):
-        return read_metadata_from_image(path)
-
-    @staticmethod
-    def seed_from_image(path):
-        return seed_from_metadata(read_metadata_from_image(path))
 
 
 if __name__ == "__main__":
