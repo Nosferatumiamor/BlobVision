@@ -943,7 +943,8 @@ select {
 #sam-overlay-clear-btn,
 #sam-overlay-reset-btn,
 #sam-cut-btn,
-#sam-keep-btn {
+#sam-keep-btn,
+#sam-export-cut-btn {
   flex: 1;
   min-width: 0;
   font-family: inherit;
@@ -960,13 +961,18 @@ select {
   text-align: center;
 }
 
+#sam-export-cut-btn {
+  width: 100%;
+}
+
 #sam-wand-btn:hover,
 #sam-clear-btn:hover:not(:disabled),
 #sam-invert-btn:hover,
 #sam-overlay-clear-btn:hover:not(:disabled),
 #sam-overlay-reset-btn:hover:not(:disabled),
 #sam-cut-btn:hover:not(:disabled),
-#sam-keep-btn:hover:not(:disabled) {
+#sam-keep-btn:hover:not(:disabled),
+#sam-export-cut-btn:hover:not(:disabled) {
   border-color: var(--accent);
   color: var(--accent);
 }
@@ -982,7 +988,8 @@ select {
 #sam-overlay-clear-btn:disabled,
 #sam-overlay-reset-btn:disabled,
 #sam-cut-btn:disabled,
-#sam-keep-btn:disabled {
+#sam-keep-btn:disabled,
+#sam-export-cut-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;
 }
