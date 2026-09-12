@@ -392,6 +392,7 @@ const samCutBtnEl = $<HTMLButtonElement>("#sam-cut-btn");
 const samKeepBtnEl = $<HTMLButtonElement>("#sam-keep-btn");
 const samCutColorEl = $<HTMLInputElement>("#sam-cut-color");
 const samCutModeRadios = document.querySelectorAll<HTMLInputElement>('input[name="sam-cut-mode"]');
+const samExportCutBtnEl = $<HTMLButtonElement>("#sam-export-cut-btn");
 const seedValueEl = $<HTMLInputElement>("#seed-value");
 const randomSeedEl = $<HTMLInputElement>("#random-seed");
 const reuseSeedEl = $<HTMLInputElement>("#reuse-seed");
@@ -1774,6 +1775,7 @@ function updateSamMaskControls() {
   samOverlayResetBtnEl.disabled = samCutAccumCanvas === null;
   samCutBtnEl.disabled = samPoints.length === 0;
   samKeepBtnEl.disabled = samPoints.length === 0;
+  samExportCutBtnEl.disabled = samCutAccumCanvas === null || !hasOutputImage();
   initImageDropEl.classList.toggle("has-mask", has);
   samShowMaskRowEl.hidden = !has;
   if (has && !samMaskWasPresent) samShowMaskToggleEl.checked = true;
@@ -1840,6 +1842,94 @@ async function commitCutMask(keep: boolean) {
   samRawMaskImg = null;
   updateSamMaskControls();
   renderSamMaskPreview();
+}
+
+// /sam2/segment returns a PIL mode-"L" PNG — a bare grayscale VALUE per
+// pixel, no alpha channel at all (drawn into a canvas, that value ends up
+// replicated into R/G/B with alpha uniformly 255). commitCutMask
+// accumulates straight from that (see morphMask/blurEdgeReplicate, both
+// plain RGB pixel edits), so samCutAccumCanvas carries the mask the same
+// way: as a grayscale VALUE, not as alpha. Canvas's destination-out/
+// destination-in only ever read a source's ALPHA channel, so this converts
+// that grayscale value into alpha first — after which the compositing below
+// reproduces the backend's Image.composite(...) math exactly.
+function grayscaleMaskToAlpha(source: CanvasImageSource, w: number, h: number): HTMLCanvasElement {
+  const tmp = document.createElement("canvas");
+  tmp.width = w;
+  tmp.height = h;
+  const tctx = tmp.getContext("2d")!;
+  tctx.drawImage(source, 0, 0, w, h);
+  const imgData = tctx.getImageData(0, 0, w, h);
+  const d = imgData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    d[i + 3] = d[i]; // alpha = grayscale value (R === G === B already)
+  }
+  tctx.putImageData(imgData, 0, 0);
+  return tmp;
+}
+
+// Applies the accumulated Cut/Keep selection straight to the last generated
+// image and downloads the result, entirely client-side — no new VQGAN run.
+// The cut is pure pixel compositing (identical math to the backend's own
+// _apply_cut_mask, just done here instead of round-tripping a fresh
+// /generate call), so there's nothing about it that actually needs the
+// model. Only meaningful once something's been generated — same
+// "cut always applies to a generation's output, never the raw upload"
+// rule the backend's cut_mask param already follows.
+async function exportCutFromOutput() {
+  if (!samCutAccumCanvas || !hasOutputImage()) return;
+  samExportCutBtnEl.disabled = true;
+  try {
+    const blob = await fetchAsBlob(outputImageEl.src);
+    const bitmap = await createImageBitmap(blob);
+    const canvas = document.createElement("canvas");
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    // The mask was captured at the init image's own resolution, which can
+    // differ from the output's (upscale, aspect-driven resize) — stretched
+    // to fit here exactly like the backend's own cut_img.resize(base.size).
+    const alphaMask = grayscaleMaskToAlpha(samCutAccumCanvas, samCutAccumCanvas.width, samCutAccumCanvas.height);
+    const cutMode = document.querySelector<HTMLInputElement>('input[name="sam-cut-mode"]:checked')?.value || "alpha";
+    if (cutMode === "color") {
+      // fill blended in proportional to the mask value — matches
+      // Image.composite(fill, base, cut_img).
+      const fillCanvas = document.createElement("canvas");
+      fillCanvas.width = canvas.width;
+      fillCanvas.height = canvas.height;
+      const fctx = fillCanvas.getContext("2d")!;
+      fctx.fillStyle = samCutColorEl.value;
+      fctx.fillRect(0, 0, fillCanvas.width, fillCanvas.height);
+      fctx.globalCompositeOperation = "destination-in";
+      fctx.drawImage(alphaMask, 0, 0, fillCanvas.width, fillCanvas.height);
+      ctx.drawImage(fillCanvas, 0, 0);
+    } else {
+      // Punches transparency in proportion to the mask value — matches
+      // new_alpha = base_alpha * (1 - cut/255): destination-out erases the
+      // destination's alpha by exactly the drawn source's own alpha, and
+      // the base image starts fully opaque, so this reproduces that
+      // subtraction exactly.
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.drawImage(alphaMask, 0, 0, canvas.width, canvas.height);
+    }
+
+    const outBlob = await new Promise<Blob | null>((resolve) => canvas.toBlob((b) => resolve(b), "image/png"));
+    if (!outBlob) throw new Error("Could not encode the cut image.");
+    const blobUrl = URL.createObjectURL(outBlob);
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = filenameFromUrl(outputImageEl.src).replace(/\.png$/i, "") + "_cut.png";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+  } catch (err) {
+    setGenStatus("Export cut failed: " + (err as Error).message, "status-error");
+  } finally {
+    samExportCutBtnEl.disabled = samCutAccumCanvas === null || !hasOutputImage();
+  }
 }
 
 function updateSamToggleVisibility() {
@@ -3936,6 +4026,7 @@ samInvertBtnEl.addEventListener("click", () => {
 });
 samCutBtnEl.addEventListener("click", () => void commitCutMask(false));
 samKeepBtnEl.addEventListener("click", () => void commitCutMask(true));
+samExportCutBtnEl.addEventListener("click", () => void exportCutFromOutput());
 samCutColorEl.addEventListener("input", renderSamMaskPreview);
 samCutModeRadios.forEach((radio) => radio.addEventListener("change", renderSamMaskPreview));
 samShowMaskToggleEl.addEventListener("change", renderSamMaskPreview);
