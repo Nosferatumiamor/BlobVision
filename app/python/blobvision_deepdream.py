@@ -10,13 +10,13 @@ import os
 import random
 import threading
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Dict, Optional
 
-from blobvision_paths import deepdream_output_dir, ensure_layout
+import blobvision_cancel
+from blobvision_paths import basename_hint_from_upload, build_output_name, ensure_layout, outputs_dir
 
 ensure_layout()
-DEFAULT_OUTPUT = deepdream_output_dir()
+DEFAULT_OUTPUT = outputs_dir()
 
 DEFAULT_STEPS = 40
 DEFAULT_OCTAVES = 4
@@ -92,11 +92,9 @@ class DeepDreamEngine:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self._lock = threading.Lock()
         self._model = None
-        self._counter = 1
         self._mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
         self._std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         os.makedirs(self.output_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.output_dir, "uploads"), exist_ok=True)
 
     def _load_model(self):
         if self._model is not None:
@@ -176,6 +174,8 @@ class DeepDreamEngine:
         handle = layer_module.register_forward_hook(hook)
         try:
             for step in range(int(steps)):
+                if blobvision_cancel.is_requested():
+                    raise blobvision_cancel.AbortedError("Generation aborted")
                 shift_h = shift_w = 0
                 if jitter > 0:
                     shift_h = random.randint(-int(jitter), int(jitter))
@@ -335,6 +335,7 @@ class DeepDreamEngine:
                     mode, int(width), int(height), layer, int(steps), int(octaves),
                 )
             )
+        blobvision_cancel.clear()
         with self._lock:
             result_tensor = self._run_octaves(
                 image, layer_module, int(steps), int(octaves), on_progress=on_progress,
@@ -348,9 +349,16 @@ class DeepDreamEngine:
                         original, size=result_tensor.shape[2:], mode="bilinear", align_corners=False,
                     )
                 result_tensor = result_tensor * (1.0 - preserve) + original * preserve
-            tag = datetime.now().strftime("deepdream_%Y%m%d_%H%M%S") + "_{:04d}".format(self._counter)
-            self._counter += 1
-            output_path = os.path.join(self.output_dir, tag + ".png")
+            # img2img's init image is a real user upload — name after it like
+            # VQGAN's corrupt mode does. redux's init image is an internally
+            # chained SDXL sketch (not an upload, no embedded basename hint
+            # to recover), so it's named after the prompt instead, same as
+            # txt2img.
+            if mode == "img2img" and init_path:
+                basename_source = basename_hint_from_upload(init_path)
+            else:
+                basename_source = prompt
+            output_path = os.path.join(self.output_dir, build_output_name("D", basename_source, ".png"))
             self._tensor_to_pil(result_tensor).save(output_path)
         meta = {
             "family": "deepdream",
@@ -370,3 +378,69 @@ class DeepDreamEngine:
         if on_progress:
             on_progress("Saved " + os.path.basename(output_path))
         return DeepDreamResult(output_path=output_path, seed=int(seed), metadata=meta)
+
+    def generate_video(
+        self,
+        video_path,
+        width,
+        height,
+        intensity=50,
+        layer=DEFAULT_LAYER,
+        seed=None,
+        frame_step=None,
+        on_progress=None,
+        encode_from_sec=0.0,
+        encode_to_sec=None,
+        use_encode_range=False,
+    ):
+        """Drives the same family-agnostic pipeline VQGAN's generate_video()
+        uses (see blobvision_video.py), just with DeepDream's own img2img
+        mode as the per-keyframe transform instead of VQGAN's "corrupt"
+        mode — everything else (extraction, RIFE, reassembly, muxing) is
+        identical between the two."""
+        import shutil
+
+        from blobvision_video import VIDEO_FRAME_STEP, _process_video
+
+        steps, octaves, preserve = intensity_to_params(intensity)
+        if frame_step is None:
+            frame_step = VIDEO_FRAME_STEP
+
+        def blobify_frame(src_path, dst_path):
+            result = self.generate(
+                mode="img2img",
+                init_image_path=src_path,
+                width=width,
+                height=height,
+                steps=steps,
+                octaves=octaves,
+                layer=layer,
+                seed=seed,
+                preserve=preserve,
+            )
+            shutil.copy2(result.output_path, dst_path)
+            # The per-keyframe still is a real, fully-named "D" file — don't
+            # let it permanently litter outputs_dir(); only the muxed final
+            # video (built by _process_video below) is meant to persist.
+            os.remove(result.output_path)
+
+        return _process_video(
+            video_path=video_path,
+            blobify_frame=blobify_frame,
+            width=width,
+            height=height,
+            frame_step=frame_step,
+            on_progress=on_progress,
+            encode_from_sec=float(encode_from_sec or 0.0),
+            encode_to_sec=encode_to_sec,
+            use_encode_range=bool(use_encode_range),
+            type_tag="DV",
+            basename_source=basename_hint_from_upload(video_path),
+            extra_meta={
+                "mode": "video",
+                "layer": layer,
+                "steps": steps,
+                "octaves": octaves,
+                "intensity": intensity,
+            },
+        )

@@ -57,20 +57,23 @@ from blobvision_engine import (
     ASPECT_CUSTOM,
     BlobVisionEngine,
     enable_hub_downloads,
-    setup_bundled_video_codecs,
-    video_codecs_status,
-    format_video_duration,
-    probe_video_file,
     guess_aspect_from_size,
     fit_size_preserving_aspect,
     resolve_aspect_size,
-    VIDEO_LONG_WARN_SECONDS,
     VQ_VIDEO_FRAME_STEP_CHOICES,
     DEFAULT_VQ_VIDEO_FRAME_STEP,
     parse_vq_video_frame_step,
     STYLE_PRESETS,
     DEFAULT_STYLE_PRESET,
     STYLE_PRESET_STEPS,
+)
+# Family-agnostic video pipeline (see blobvision_video.py's module docstring).
+from blobvision_video import (
+    VIDEO_LONG_WARN_SECONDS,
+    format_video_duration,
+    probe_video_file,
+    setup_bundled_video_codecs,
+    video_codecs_status,
 )
 
 from blobvision_deepdream import (
@@ -310,15 +313,13 @@ def _header_brand_html():
 
 
 DISCLAIMER = (
-    "BlobVision is unfiltered and may produce unpredictable results. "
-    "We accept no liability for generations or how you use them - "
-    "you alone are responsible for any images you create or share."
+    "BlobVision is unfiltered. Use at your own risk—you are solely responsible "
+    "for any generated or shared images."
 )
 
 CREDIT = (
-    "Designed by GROM with Cursor. Open source - "
-    "rooted in RiversHaveWings' historic Colab notebook; "
-    "BlobVision seeks to preserve its aesthetic and memory."
+    "Vibe-coded by GROM with Cursor and Claude. Open source, inspired by "
+    "RiversHaveWings' historic Colab notebook."
 )
 
 
@@ -1648,7 +1649,7 @@ def activate_video_mode():
         global _codecs_setup_running
         _codecs_setup_running = True
         try:
-            from blobvision_engine import VIDEO_CODECS_ROOT
+            from blobvision_paths import VIDEO_CODECS_ROOT
             blobvision_log.append(
                 "Video: téléchargement ffmpeg + RIFE → {} …".format(VIDEO_CODECS_ROOT),
             )
@@ -2668,21 +2669,12 @@ def disconnect_server():
     return poll_status(), poll_start_btn(), poll_banner()
 
 def open_gallery():
-    global _current_family, _dd_engine, _st_engine, _engine
-    from blobvision_paths import deepdream_output_dir, style_output_dir, vqgan_output_dir
-    if _current_family == "deepdream" and _dd_engine is not None:
-        out = _dd_engine.output_dir
-    elif _current_family == "deepdream":
-        out = deepdream_output_dir()
-    elif _current_family == "style" and _st_engine is not None:
-        out = _st_engine.output_dir
-    elif _current_family == "style":
-        out = style_output_dir()
-    elif _engine is not None:
-        out = _engine.output_dir
-    else:
-        out = vqgan_output_dir()
-    out = os.path.abspath(out)
+    # All families now share one flat outputs/ folder (see this session's
+    # outputs-restructuring work — filenames carry a V/D/S/M type tag
+    # instead of a subfolder), so there's no per-family engine/dir to
+    # resolve anymore.
+    from blobvision_paths import outputs_dir
+    out = os.path.abspath(outputs_dir())
     os.makedirs(out, exist_ok=True)
     if sys.platform == "win32":
         os.startfile(out)
@@ -3309,6 +3301,23 @@ def _launch_demo(demo, host, port, share, open_browser=False):
 def _cleanup_on_exit():
     try:
         _dispose_engine()
+    except Exception:
+        pass
+    # This standalone Gradio entry point exits via a normal Python
+    # interpreter shutdown (unlike the Tauri shell, which hard-kills the
+    # process — see main.rs's own uploads sweep for that path), so a real
+    # atexit hook reliably fires here.
+    try:
+        import shutil
+
+        from blobvision_paths import uploads_dir
+
+        for name in os.listdir(uploads_dir()):
+            path = os.path.join(uploads_dir(), name)
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
     except Exception:
         pass
 

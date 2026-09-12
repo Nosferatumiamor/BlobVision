@@ -43,3 +43,10 @@ Thumbs.db
 .vscode/
 .idea/
 .cursor/
+.claude/
+
+# Tauri shell (tauri/) — npm/cargo build artifacts, not source
+tauri/node_modules/
+tauri/dist/
+tauri/src-tauri/target/
+tauri/src-tauri/gen/

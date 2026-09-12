@@ -3,20 +3,22 @@ import os
 import random
 import threading
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 
+import blobvision_cancel
 from blobvision_paths import (
     STYLE_WEIGHTS_DIR,
+    basename_hint_from_upload,
+    build_output_name,
     ensure_layout,
-    style_output_dir,
+    outputs_dir,
     style_weights_path,
 )
 
 ensure_layout()
 WEIGHTS_DIR = STYLE_WEIGHTS_DIR
 WEIGHTS_PATH = style_weights_path()
-DEFAULT_OUTPUT = style_output_dir()
+DEFAULT_OUTPUT = outputs_dir()
 MIN_WEIGHTS_BYTES = 1024 * 1024
 
 
@@ -51,6 +53,14 @@ DEFAULT_STEPS = 300
 DEFAULT_STYLE_STRENGTH = 1.0
 DEFAULT_CONTENT_WEIGHT = 1.0
 BASE_STYLE_WEIGHT = 1e6
+# Classic Gatys video keyframes get far fewer steps than a still image —
+# every frame starts from its own content pixels already (see generate()'s
+# target = content.clone()), so a lower step count just means a lighter/
+# less "cooked" style rather than a broken result, and dozens of keyframes
+# at 300 steps each would be unusably slow. No inter-frame temporal
+# consistency term either way (classic Gatys has none) — flicker between
+# keyframes is expected and accepted, not a bug, per product decision.
+VIDEO_STEPS = 30
 
 CONTENT_LAYERS = ["21"]
 STYLE_LAYERS = ["1", "6", "11", "20", "28"]
@@ -71,7 +81,6 @@ class StyleTransferEngine:
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self._lock = threading.Lock()
         self._vgg = None
-        self._counter = 1
         self._mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
         self._std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         os.makedirs(self.output_dir, exist_ok=True)
@@ -183,8 +192,11 @@ class StyleTransferEngine:
                 )
             )
 
+        blobvision_cancel.clear()
         with self._lock:
             for step in range(int(steps)):
+                if blobvision_cancel.is_requested():
+                    raise blobvision_cancel.AbortedError("Generation aborted")
                 optimizer.zero_grad(set_to_none=True)
                 target_features = self._extract_features(target, CONTENT_LAYERS + STYLE_LAYERS)
 
@@ -210,9 +222,10 @@ class StyleTransferEngine:
 
             arr = target.detach().squeeze(0).permute(1, 2, 0).cpu().numpy()
             arr = (arr * 255.0).astype("uint8")
-            tag = datetime.now().strftime("style_%Y%m%d_%H%M%S") + "_{:04d}".format(self._counter)
-            self._counter += 1
-            output_path = os.path.join(self.output_dir, tag + ".png")
+            # The content image is the "subject" of a style transfer (the
+            # style image is just the aesthetic donor), so it drives BASENAME.
+            out_name = build_output_name("S", basename_hint_from_upload(content_image_path), ".png")
+            output_path = os.path.join(self.output_dir, out_name)
             Image.fromarray(arr, mode="RGB").save(output_path)
 
         meta = {
@@ -230,3 +243,45 @@ class StyleTransferEngine:
         if on_progress:
             on_progress("Saved " + os.path.basename(output_path))
         return StyleTransferResult(output_path=output_path, seed=int(seed), metadata=meta)
+
+    def generate_video(
+        self, video_path, style_image_path, width, height,
+        style_strength=DEFAULT_STYLE_STRENGTH, content_weight=DEFAULT_CONTENT_WEIGHT,
+        steps=VIDEO_STEPS, seed=None, frame_step=None, on_progress=None,
+        encode_from_sec=0.0, encode_to_sec=None, use_encode_range=False,
+    ):
+        """Classic Gatys path for Style Transfer video — the SDXL-preset
+        path bypasses this engine entirely (see
+        BlobVisionEngine.generate_style_preset_video in blobvision_engine.py)
+        since a preset doesn't touch VGG19 at all. Drives the same family-
+        agnostic pipeline VQGAN/DeepDream's video modes use (see
+        blobvision_video.py), with the classic optimizer's reduced VIDEO_STEPS
+        default as the per-keyframe transform."""
+        import shutil
+        from blobvision_video import VIDEO_FRAME_STEP, _process_video
+        if frame_step is None:
+            frame_step = VIDEO_FRAME_STEP
+
+        def blobify_frame(src_path, dst_path):
+            result = self.generate(
+                content_image_path=src_path, style_image_path=style_image_path,
+                width=width, height=height, steps=steps,
+                style_strength=style_strength, content_weight=content_weight, seed=seed,
+            )
+            shutil.copy2(result.output_path, dst_path)
+            # The per-keyframe still is a real, fully-named "S" file — don't
+            # let it permanently litter outputs_dir(); only the muxed final
+            # video (built by _process_video below) is meant to persist.
+            os.remove(result.output_path)
+
+        return _process_video(
+            video_path=video_path, blobify_frame=blobify_frame, width=width, height=height,
+            frame_step=frame_step, on_progress=on_progress,
+            encode_from_sec=float(encode_from_sec or 0.0), encode_to_sec=encode_to_sec,
+            use_encode_range=bool(use_encode_range),
+            type_tag="SV", basename_source=basename_hint_from_upload(video_path),
+            extra_meta={
+                "mode": "video", "engine": "classic", "steps": int(steps),
+                "style_strength": float(style_strength), "content_weight": float(content_weight),
+            },
+        )

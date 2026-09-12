@@ -1,6 +1,9 @@
 """Central path layout for BlobVision V1 (portable, repo-relative)."""
 import os
+import re
 import shutil
+import threading
+from datetime import datetime
 
 _PY_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_DIR = os.path.dirname(_PY_DIR)
@@ -10,6 +13,12 @@ BLOBDREAM_ROOT = BLOBVISION_ROOT
 
 MODELS_ROOT = os.path.join(BLOBVISION_ROOT, "models")
 OUTPUTS_ROOT = os.path.join(BLOBVISION_ROOT, "outputs")
+# Ephemeral video-job scratch space (per-job src/processed/interpolated frame
+# dirs) — a sibling of outputs/, not nested inside it, so outputs/ only ever
+# holds finished renders + sketch/. Cleared per-job once the final video is
+# muxed into outputs/ (see blobvision_video.py), with a startup sweep here in
+# ensure_layout() as a backstop for jobs killed mid-run.
+WORK_ROOT = os.path.join(BLOBVISION_ROOT, "work")
 VIDEO_CODECS_ROOT = os.path.join(BLOBVISION_ROOT, "video-codecs")
 VENV_PYTHON = os.path.join(BLOBVISION_ROOT, "venv", "Scripts", "python.exe")
 
@@ -27,8 +36,18 @@ HF_CACHE_ROOT = os.path.join(MODELS_ROOT, "hf_cache")
 STYLE_WEIGHTS_DIR = os.path.join(MODELS_ROOT, "style-transfer")
 STYLE_WEIGHTS_PATH = os.path.join(STYLE_WEIGHTS_DIR, "vgg19_imagenet.pth")
 UPSCALE_MODEL_DIR = os.path.join(MODELS_ROOT, "upscale")
-UPSCALE_MODEL_PATH = os.path.join(UPSCALE_MODEL_DIR, "RealESRGAN_x2plus.pth")
+UPSCALE_MODEL_PATHS = {
+    2: os.path.join(UPSCALE_MODEL_DIR, "RealESRGAN_x2plus.pth"),
+    4: os.path.join(UPSCALE_MODEL_DIR, "RealESRGAN_x4plus.pth"),
+}
 CAPTION_MODEL_DIR = os.path.join(MODELS_ROOT, "caption")
+SAM2_MODEL_DIR = os.path.join(MODELS_ROOT, "sam2")
+# facebook/sam2.1-hiera-small on Hugging Face — config ships inside the sam2
+# pip package itself (hydra-resolved by name, not downloaded); only the
+# checkpoint needs fetching. See app/scripts/download_sam2.py.
+SAM2_CONFIG_NAME = "configs/sam2.1/sam2.1_hiera_s.yaml"
+SAM2_CHECKPOINT_NAME = "sam2.1_hiera_small.pt"
+SAM2_HF_REPO = "facebook/sam2.1-hiera-small"
 
 VQGAN_CONFIG_NAME = "vqgan_imagenet_f16_16384.yaml"
 VQGAN_CHECKPOINT_NAME = "vqgan_imagenet_f16_16384.ckpt"
@@ -60,15 +79,31 @@ def _pick_file(preferred, *legacy):
 def ensure_layout():
     """Create V1 folders; migrate legacy weights/outputs when safe."""
     os.makedirs(MODELS_ROOT, exist_ok=True)
-    os.makedirs(OUTPUTS_ROOT, exist_ok=True)
+    os.makedirs(outputs_dir(), exist_ok=True)
+    os.makedirs(sketch_dir(), exist_ok=True)
+    os.makedirs(uploads_dir(), exist_ok=True)
+    os.makedirs(work_dir(), exist_ok=True)
     os.makedirs(VQGAN_MODEL_DIR, exist_ok=True)
     os.makedirs(OPENCLIP_ROOT, exist_ok=True)
     os.makedirs(HF_CACHE_ROOT, exist_ok=True)
     os.makedirs(STYLE_WEIGHTS_DIR, exist_ok=True)
     os.makedirs(UPSCALE_MODEL_DIR, exist_ok=True)
     os.makedirs(CAPTION_MODEL_DIR, exist_ok=True)
-    for sub in ("vqgan", "deepdream", "style-transfer"):
-        os.makedirs(os.path.join(OUTPUTS_ROOT, sub), exist_ok=True)
+    os.makedirs(SAM2_MODEL_DIR, exist_ok=True)
+
+    # A video job normally clears its own work/job_<uuid> dir in a finally
+    # block once its final render lands in outputs/ (see blobvision_video.py)
+    # — this only leaves stale entries behind if the process was killed
+    # mid-job. Sweep them on every startup so work/ never accumulates.
+    for name in os.listdir(work_dir()):
+        path = os.path.join(work_dir(), name)
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.remove(path)
+        except OSError:
+            pass
 
     _migrate_tree(_LEGACY_VQGAN_DIR, VQGAN_MODEL_DIR, (
         VQGAN_CONFIG_NAME,
@@ -82,28 +117,20 @@ def ensure_layout():
         except OSError:
             pass
 
+    # Pre-V1 legacy location (app/outputs/, not the per-family outputs/vqgan
+    # etc. this module used until this session's flatten) — much older/rarer
+    # than the current data, so a straight flatten into outputs_dir() (no
+    # retroactive YYMMDD_TYPE_NNN renaming) is enough.
     _legacy_outputs = os.path.join(APP_DIR, "outputs")
     if os.path.isdir(_legacy_outputs):
         for name in os.listdir(_legacy_outputs):
             if name in ("modelscope",):
                 continue
             src = os.path.join(_legacy_outputs, name)
-            if name.endswith(".png") or name.endswith(".mp4") or name.startswith("video_"):
-                dst = os.path.join(vqgan_output_dir(), name)
-            elif name == "deepdream":
-                dst = os.path.join(deepdream_output_dir(), name)
-                if os.path.isdir(src):
-                    _merge_tree(src, deepdream_output_dir())
-                    continue
-            elif name == "style-transfer":
-                dst = os.path.join(style_output_dir(), name)
-                if os.path.isdir(src):
-                    _merge_tree(src, style_output_dir())
-                    continue
-            elif name == "uploads":
-                dst = os.path.join(vqgan_output_dir(), name)
-            else:
-                dst = os.path.join(vqgan_output_dir(), name)
+            if os.path.isdir(src):
+                _merge_tree(src, outputs_dir())
+                continue
+            dst = os.path.join(outputs_dir(), name)
             if os.path.exists(dst):
                 continue
             try:
@@ -164,24 +191,96 @@ def style_weights_path():
     return _pick_file(STYLE_WEIGHTS_PATH, _LEGACY_STYLE_WEIGHTS)
 
 
-def upscale_model_path():
-    return UPSCALE_MODEL_PATH
+def upscale_model_path(scale=2):
+    return UPSCALE_MODEL_PATHS[scale]
 
 
 def caption_model_dir():
     return CAPTION_MODEL_DIR
 
 
-def vqgan_output_dir():
-    return os.path.join(OUTPUTS_ROOT, "vqgan")
+def sam2_model_dir():
+    return SAM2_MODEL_DIR
 
 
-def deepdream_output_dir():
-    return os.path.join(OUTPUTS_ROOT, "deepdream")
+def sam2_checkpoint_path():
+    return os.path.join(SAM2_MODEL_DIR, SAM2_CHECKPOINT_NAME)
 
 
-def style_output_dir():
-    return os.path.join(OUTPUTS_ROOT, "style-transfer")
+def outputs_dir():
+    """Flat home for every finished render — VQGAN/DeepDream/Style/Meme,
+    images and videos alike. Distinguished on disk only by the TYPE tag in
+    build_output_name()'s filename, not by subfolder."""
+    return OUTPUTS_ROOT
+
+
+def sketch_dir():
+    """Pre-blobify SDXL sketch renders, kept out of outputs_dir() so the
+    flat gallery only shows finished pieces."""
+    return os.path.join(OUTPUTS_ROOT, "sketch")
+
+
+def uploads_dir():
+    """Shared scratch space for uploaded init/content/style images and
+    source videos, across all families."""
+    return os.path.join(OUTPUTS_ROOT, "uploads")
+
+
+def work_dir():
+    return WORK_ROOT
+
+
+_naming_lock = threading.Lock()
+
+
+def sanitize_basename(text, max_len=40):
+    """Strips any extension, lower-cases, collapses everything that isn't
+    a-z0-9 into single underscores, and truncates — used both for the
+    BASENAME segment of build_output_name() and for embedding a readable
+    hint into upload scratch filenames (see basename_hint_from_upload)."""
+    text = os.path.splitext(text or "")[0].strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return (text or "output")[:max_len]
+
+
+def basename_hint_from_upload(stored_path):
+    """Recovers the sanitized original filename embedded by the upload
+    endpoints' `<uuid>__<original>` naming (see blobvision_api.py's
+    /generate, /style/generate, /video/upload) — falls back to the stored
+    file's own stem if the `__` marker isn't present (e.g. a sketch/init
+    path that was never routed through an upload endpoint)."""
+    stem = os.path.splitext(os.path.basename(stored_path))[0]
+    return stem.split("__", 1)[1] if "__" in stem else stem
+
+
+def build_output_name(type_tag, basename_source, ext, base_dir=None):
+    """YYMMDD_TYPE_NNN_BASENAME.EXT — NNN is the next free 3-digit counter
+    for (date, type_tag) in base_dir (default outputs_dir()), scanned off
+    disk rather than kept in memory so it survives process restarts.
+    Reserves the slot immediately (an empty placeholder file, O_CREAT |
+    O_EXCL) under a lock so two callers sharing a type_tag from different
+    engines/locks (e.g. classic-Gatys and SDXL-preset both writing "S")
+    can't race each other onto the same NNN — the caller's real save
+    (PIL .save() / ffmpeg -y) just overwrites the placeholder afterward."""
+    base_dir = base_dir or OUTPUTS_ROOT
+    date_str = datetime.now().strftime("%y%m%d")
+    basename = sanitize_basename(basename_source)
+    prefix = "{}_{}_".format(date_str, type_tag)
+    with _naming_lock:
+        os.makedirs(base_dir, exist_ok=True)
+        existing = [n for n in os.listdir(base_dir) if n.startswith(prefix)]
+        max_n = 0
+        for name in existing:
+            num = name[len(prefix):].split("_", 1)[0]
+            if num.isdigit():
+                max_n = max(max_n, int(num))
+        filename = "{}{:03d}_{}{}".format(prefix, max_n + 1, basename, ext)
+        path = os.path.join(base_dir, filename)
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            pass
+    return filename
 
 
 def vqgan_config_path():
@@ -205,9 +304,9 @@ def gradio_allowed_paths():
         MODELS_ROOT,
         VIDEO_CODECS_ROOT,
         tempfile.gettempdir(),
-        vqgan_output_dir(),
-        deepdream_output_dir(),
-        style_output_dir(),
+        outputs_dir(),
+        sketch_dir(),
+        uploads_dir(),
     )
     allowed = []
     seen = set()

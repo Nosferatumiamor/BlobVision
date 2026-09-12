@@ -1,13 +1,15 @@
-"""Real-ESRGAN x2 post-processing upscaler, shared across all BlobVision families.
+"""Real-ESRGAN x2/x4 post-processing upscaler, shared across all BlobVision families.
 
 Runs after generation, on request only — never as part of the generation loop itself.
 Uses spandrel (pure PyTorch arch loader) instead of the official realesrgan/basicsr
 packages: basicsr imports torchvision.transforms.functional_tensor, which newer
 torchvision releases removed, so the official package fails to import outright.
 
-x2 rather than x4: plenty to make the "pourri" texture readable without the output
-turning into an unwieldy multi-thousand-pixel file, and it's a purpose-trained x2
-checkpoint rather than a x4 model resized down after the fact.
+x2 is the default/lighter option: plenty to make the "pourri" texture readable
+without the output turning into an unwieldy multi-thousand-pixel file, and it's a
+purpose-trained x2 checkpoint rather than a x4 model resized down after the fact.
+x4 is offered alongside it (its own purpose-trained checkpoint, not x2 run twice)
+for when a bigger output is actually wanted.
 """
 import os
 import threading
@@ -16,8 +18,10 @@ from blobvision_paths import ensure_layout, upscale_model_path
 
 ensure_layout()
 
-UPSCALE_MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
-UPSCALE_SCALE = 2
+UPSCALE_MODEL_URLS = {
+    2: "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth",
+    4: "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
+}
 MIN_WEIGHTS_BYTES = 1024 * 1024
 
 # Caps peak VRAM by downscaling oversized inputs before upscaling rather than feeding
@@ -25,32 +29,35 @@ MIN_WEIGHTS_BYTES = 1024 * 1024
 MAX_INPUT_SIDE = 900
 
 
-def upscale_weights_status():
-    path = upscale_model_path()
+def upscale_weights_status(scale=2):
+    path = upscale_model_path(scale)
     ready = os.path.isfile(path) and os.path.getsize(path) >= MIN_WEIGHTS_BYTES
     return {"ready": ready, "path": path}
 
 
-def download_upscale_weights(on_progress=None):
-    status = upscale_weights_status()
+def download_upscale_weights(scale=2, on_progress=None):
+    status = upscale_weights_status(scale)
     if status["ready"]:
         return status["path"]
     path = status["path"]
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if on_progress:
-        on_progress("Downloading Real-ESRGAN weights (~64 MB)...")
+        on_progress("Downloading Real-ESRGAN x{} weights...".format(scale))
     import torch
 
-    torch.hub.download_url_to_file(UPSCALE_MODEL_URL, path, progress=True)
+    torch.hub.download_url_to_file(UPSCALE_MODEL_URLS[scale], path, progress=True)
     if on_progress:
-        on_progress("Real-ESRGAN weights installed.")
+        on_progress("Real-ESRGAN x{} weights installed.".format(scale))
     return path
 
 
 class UpscaleEngine:
-    def __init__(self, device=None):
+    def __init__(self, device=None, scale=2):
         import torch
 
+        if scale not in UPSCALE_MODEL_URLS:
+            raise ValueError("Unsupported upscale factor: {}".format(scale))
+        self.scale = scale
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         self._lock = threading.Lock()
         self._model = None
@@ -58,7 +65,7 @@ class UpscaleEngine:
     def _load_model(self):
         if self._model is not None:
             return self._model
-        path = download_upscale_weights()
+        path = download_upscale_weights(self.scale)
         from spandrel import ModelLoader
 
         model = ModelLoader().load_from_file(path)
@@ -84,7 +91,7 @@ class UpscaleEngine:
                 )
             if on_progress:
                 on_progress(
-                    "Upscaling {}x{} -> x{}...".format(img.width, img.height, UPSCALE_SCALE)
+                    "Upscaling {}x{} -> x{}...".format(img.width, img.height, self.scale)
                 )
             arr = np.asarray(img).astype("float32") / 255.0
             tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(self.device)

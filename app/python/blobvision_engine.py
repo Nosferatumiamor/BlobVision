@@ -2,11 +2,9 @@
 import gc
 import math
 import os
-import re
 import sys
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Any, Dict, Optional
 
 from blobvision_paths import (
@@ -14,16 +12,18 @@ from blobvision_paths import (
     BLOBVISION_ROOT,
     BLOBDREAM_ROOT,
     TAMING_REPO,
-    VIDEO_CODECS_ROOT,
+    basename_hint_from_upload,
+    build_output_name,
     ensure_layout,
+    outputs_dir,
     sdxl_model_dir,
-    vqgan_output_dir,
+    sketch_dir,
 )
 
 SCRIPT_DIR = APP_DIR
 ensure_layout()
 DEFAULT_SKETCH_MODEL = sdxl_model_dir()
-DEFAULT_OUTPUT = vqgan_output_dir()
+DEFAULT_OUTPUT = outputs_dir()
 _PY_DIR = os.path.dirname(os.path.abspath(__file__))
 
 try:
@@ -35,6 +35,10 @@ for path in (APP_DIR, _PY_DIR, TAMING_REPO, BLOBDREAM_ROOT):
         sys.path.insert(0, path)
 
 from blobvision_meta import build_metadata, metadata_for_png, read_metadata_from_image, seed_from_metadata
+# The generic ffmpeg/RIFE video pipeline — see blobvision_video.py's module
+# docstring for why this lives in its own file (DeepDream needs the exact
+# same pipeline, driven by its own per-frame callback, not VQGAN's).
+from blobvision_video import VIDEO_FRAME_STEP, _process_video, setup_bundled_video_codecs
 
 
 class BlobVRAMCache:
@@ -59,6 +63,8 @@ class BlobVRAMCache:
             raise ValueError("phase must be sketch or vqgan")
         if phase == self.active:
             return
+        import time
+        t0 = time.time()
         if phase == self.PHASE_SKETCH:
             self._park_vqgan(log)
             self._unpark_sketch(log)
@@ -67,6 +73,7 @@ class BlobVRAMCache:
             self._unpark_vqgan(log)
         self.active = phase
         self._log_vram(phase, log)
+        self._say("VRAM cache: phase switch -> {} took {:.1f}s total.".format(phase, time.time() - t0), log)
 
     def note_sketch_loaded_on_gpu(self):
         if self.engine._sketch_pipe is not None and self.engine.sketch_full_gpu:
@@ -77,7 +84,14 @@ class BlobVRAMCache:
             self._vqgan_on_gpu = True
 
     def _say(self, msg, log):
-        print(msg, flush=True)
+        try:
+            print(msg, flush=True)
+        except OSError:
+            # stdout can be an unflushable handle (e.g. a Windows anonymous pipe
+            # under some subprocess launchers, or no console at all in a
+            # windowed build) — a broken debug print must never abort a
+            # generation that's otherwise working fine.
+            pass
         if log is not None:
             log(msg)
 
@@ -114,10 +128,33 @@ class BlobVRAMCache:
             return
         self._say("VRAM cache: parking SDXL on CPU...", log)
         try:
+            import logging
             import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                pipe.to("cpu")
+            # warnings.catch_warnings() only silences Python's `warnings`
+            # module — it does nothing for diffusers' "Pipelines loaded with
+            # dtype=torch.float16 cannot run with cpu device..." message,
+            # which comes from its own logging.Logger("diffusers") instead.
+            # That message is a false alarm here (we're relocating the pipe
+            # to free VRAM, not about to run inference on it while parked),
+            # but printed on every single park — i.e. every VQGAN
+            # generation from now on — it reads as something breaking.
+            # Raising the logger's own level is the only thing that
+            # actually silences it.
+            diffusers_logger = logging.getLogger("diffusers")
+            prev_level = diffusers_logger.level
+            diffusers_logger.setLevel(logging.ERROR)
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    run_with_patience(
+                        lambda: pipe.to("cpu"),
+                        label="SDXL CPU park",
+                        on_stage=log,
+                        estimate_sec=60,
+                        interval=15,
+                    )
+            finally:
+                diffusers_logger.setLevel(prev_level)
         except Exception as exc:
             self._say("VRAM cache: SDXL park note: " + str(exc), log)
         self._sketch_on_gpu = False
@@ -132,17 +169,24 @@ class BlobVRAMCache:
             return
         if self._sketch_on_gpu:
             return
-        self._say(
-            "VRAM cache: moving SDXL to GPU (~1-3 min, please be patient)...",
-            log,
-        )
+        # Measured: this park<->unpark cycle (moving an already-loaded pipe
+        # between CPU RAM and GPU VRAM) is fast — 1-2s in testing, every
+        # time, including the very first one. The genuinely slow "~1-3 min,
+        # up to 5 min" cost is a SEPARATE one-time thing: _load_sketch_pipe()
+        # placing SDXL on GPU for the first time ever in this process (cold
+        # CUDA context + first big allocation), not this recurring swap.
+        # This message used to (wrongly) quote that same "~1-3 min" estimate
+        # here too, which was misleading for every generation after the
+        # first — see the "moving ~6.5 GB to GPU" message in
+        # _load_sketch_pipe for the one that actually deserves it.
+        self._say("VRAM cache: moving SDXL to GPU (usually a couple seconds once already loaded)...", log)
         try:
             run_with_patience(
                 lambda: pipe.to(self.engine.cuda_device),
                 label="SDXL GPU transfer",
                 on_stage=log,
-                estimate_sec=150,
-                interval=30,
+                estimate_sec=10,
+                interval=5,
             )
             self._sketch_on_gpu = True
         except Exception as exc:
@@ -156,10 +200,14 @@ class BlobVRAMCache:
         if eng.model is None:
             return
         self._say("VRAM cache: parking VQGAN+CLIP on CPU...", log)
-        try:
+
+        def _do_park():
             eng.model.to("cpu")
             if eng.perceptor is not None:
                 eng.perceptor.to("cpu")
+
+        try:
+            run_with_patience(_do_park, label="VQGAN+CLIP CPU park", on_stage=log, estimate_sec=15, interval=10)
         except Exception as exc:
             self._say("VRAM cache: VQGAN park note: " + str(exc), log)
         self._vqgan_on_gpu = False
@@ -175,10 +223,14 @@ class BlobVRAMCache:
         if not self.engine.cuda_device.startswith("cuda") or not torch.cuda.is_available():
             return
         self._say("VRAM cache: moving VQGAN+CLIP to GPU...", log)
-        try:
+
+        def _do_unpark():
             eng.model.to(self.engine.cuda_device)
             if eng.perceptor is not None:
                 eng.perceptor.to(self.engine.cuda_device)
+
+        try:
+            run_with_patience(_do_unpark, label="VQGAN+CLIP GPU transfer", on_stage=log, estimate_sec=15, interval=10)
             self._vqgan_on_gpu = True
         except Exception as exc:
             self._say("VRAM cache: VQGAN unpark note: " + str(exc), log)
@@ -234,8 +286,6 @@ DEFAULT_ASPECT = "1:1"
 IMG2IMG_MAX_PIXELS = max(w * h for w, h in ASPECT_FORMATS.values())
 IMG2IMG_MAX_SIDE = max(max(w, h) for w, h in ASPECT_FORMATS.values())
 IMG2IMG_MIN_SIDE = 64
-VIDEO_FRAME_STEP = 4
-VQ_VIDEO_MAX_SOURCE_FPS = 30.0
 # Default first — Gradio may send radio index 0 when the control was hidden at submit.
 VQ_VIDEO_FRAME_STEP_CHOICES = ["4 frames", "2 frames", "off"]
 VQ_VIDEO_FRAME_STEP_MAP = {"off": 1, "2 frames": 2, "4 frames": 4}
@@ -261,97 +311,6 @@ def parse_vq_video_frame_step(label):
     return VQ_VIDEO_FRAME_STEP_MAP[DEFAULT_VQ_VIDEO_FRAME_STEP]
 
 
-def _subsample_frame_paths(frames, step):
-    """Keep every Nth frame; always retain the last frame for timeline coverage."""
-    step = max(1, int(step))
-    frames = list(frames)
-    if step == 1 or len(frames) <= 1:
-        return frames
-    picked = frames[::step]
-    if picked[-1] != frames[-1]:
-        picked.append(frames[-1])
-    return picked
-
-
-def _resolve_timeline_fps(probed_fps, decoded_fps=None):
-    """Playback cadence for sync — collapses 96/72fps export artifacts to 24/30/etc."""
-    rates = [float(r) for r in (decoded_fps, probed_fps) if r and float(r) > 0.0]
-    rate = max(rates) if rates else 24.0
-    if rate <= 48.0:
-        return rate if rate >= 5.0 else 24.0
-    # Prefer the smallest standard base (96 -> 24x4, not 50x2).
-    for base in (24.0, 25.0, 30.0, 48.0, 50.0, 60.0):
-        ratio = rate / base
-        nearest = round(ratio)
-        if nearest >= 2 and abs(ratio - nearest) < 0.05:
-            return base
-    return 30.0 if rate > 60.0 else rate
-
-
-def _normalize_working_fps(source_fps):
-    """Cap input cadence to 24/25/30 before VQGAN when the container runs faster."""
-    fps = float(source_fps)
-    if fps <= VQ_VIDEO_MAX_SOURCE_FPS:
-        return fps
-    if fps <= 60.0:
-        return 30.0
-    return _resolve_timeline_fps(fps)
-
-
-def _normalize_video_clip(
-    video_path, out_path, start_sec, duration_sec, target_fps, on_progress=None,
-):
-    """Re-encode a clip segment at a lower constant fps (silent proxy for frame work)."""
-    import subprocess
-
-    cmd = [_find_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error"]
-    if start_sec and float(start_sec) > 0:
-        cmd.extend(["-ss", str(float(start_sec))])
-    cmd.extend(["-i", video_path])
-    if duration_sec is not None and float(duration_sec) > 0:
-        cmd.extend(["-t", str(float(duration_sec))])
-    cmd.extend([
-        "-vf", "fps={:.6f}".format(float(target_fps)),
-        "-an",
-        "-c:v", "libx264",
-        "-pix_fmt", "yuv420p",
-        "-crf", "18",
-        out_path,
-    ])
-    _video_log(
-        "Video: normalizing clip to {:.1f} fps — {}".format(float(target_fps), " ".join(cmd)),
-        on_progress,
-    )
-    subprocess.check_call(cmd)
-    if not os.path.isfile(out_path):
-        raise RuntimeError("Video normalization failed: " + out_path)
-    return out_path
-
-
-def _estimate_vq_video_keyframes(clip_duration, timeline_fps, frame_step):
-    clip_duration = max(0.05, float(clip_duration))
-    timeline_fps = max(1.0, float(timeline_fps))
-    frame_step = max(1, int(frame_step))
-    if frame_step <= 1:
-        return max(2, int(round(clip_duration * timeline_fps)))
-    return max(2, int(round(clip_duration * timeline_fps / frame_step)))
-
-
-def _downsample_frame_paths_to_count(frames, target_count):
-    frames = list(frames)
-    target_count = max(1, int(target_count))
-    if len(frames) <= target_count:
-        return frames
-    if target_count == 1:
-        return [frames[0]]
-    picked = []
-    last_idx = -1
-    for i in range(target_count):
-        idx = int(round(i * (len(frames) - 1) / float(target_count - 1)))
-        idx = max(last_idx + 1 if i else 0, min(idx, len(frames) - 1))
-        picked.append(frames[idx])
-        last_idx = idx
-    return picked
 VQGAN_NEGATIVE_WEIGHT = -1.0
 # diffusers only turns on classifier-free guidance when guidance_scale > 1 (strictly —
 # see StableDiffusionXLImg2ImgPipeline.do_classifier_free_guidance:
@@ -632,6 +591,27 @@ STYLE_PRESETS = {
         "strength": 0.55,
         "negative_prompt": "painting, illustration",
     },
+    "frazetta": {
+        "label": "Heroic Fantasy (Frazetta)",
+        "prompt": "heroic fantasy oil painting, in the style of Frank Frazetta, muscular dynamic figures, dramatic moody lighting, rich earthy color palette, painterly brushwork, epic sword and sorcery illustration",
+        "strength": 0.5,
+    },
+    "vallejo": {
+        "label": "Fantasy Pin-up (Boris Vallejo)",
+        "prompt": "fantasy paperback cover art, in the style of Boris Vallejo, airbrushed oil painting, glossy idealized musculature, dramatic heroic pose, vivid saturated lighting",
+        "strength": 0.5,
+    },
+    "giger": {
+        "label": "Biomechanical (Giger)",
+        "prompt": "biomechanical surrealist artwork, in the style of H.R. Giger, dark chrome and organic textures fused, alien xenomorph aesthetic, airbrushed monochrome greys, ominous atmospheric lighting",
+        "negative_prompt": "bright colors, pastel, cheerful",
+        "strength": 0.5,
+    },
+    "howe": {
+        "label": "Epic Fantasy (John Howe)",
+        "prompt": "epic fantasy illustration, in the style of John Howe, detailed atmospheric watercolor and ink linework, painterly Tolkien-inspired landscapes, dramatic scale and lighting",
+        "strength": 0.5,
+    },
     "custom": {
         "label": "Custom",
         "prompt": "",
@@ -700,11 +680,6 @@ def build_vqgan_prompts(positive, negative=None, neg_weight=VQGAN_NEGATIVE_WEIGH
     return prompts if prompts else [positive.strip()]
 
 
-def slugify(text, max_len=40):
-    text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    text = text.strip("_")
-    return (text or "prompt")[:max_len]
 
 
 def sketch_model_ready(model_dir):
@@ -727,7 +702,12 @@ def log_line(msg, on_stage=None):
     msg = (msg or "").strip()
     if not msg:
         return
-    print(msg, flush=True)
+    try:
+        print(msg, flush=True)
+    except OSError:
+        # See BlobVRAMCache._say — an unflushable stdout must never abort
+        # generation just because a progress line couldn't be printed.
+        pass
     if on_stage is not None:
         on_stage(msg)
 
@@ -865,8 +845,28 @@ def resolve_sketch_full_gpu(cuda_device="cuda:0", explicit=None):
         return False
     try:
         free, total = torch.cuda.mem_get_info()
+        # Printed unconditionally (not just on the "chose CPU offload" branch)
+        # so the decision is never a black box — a user seeing CPU-offload
+        # mode despite a card that "should" qualify can check this line
+        # instead of guessing whether something else was already holding
+        # VRAM when BlobVision started.
+        print(
+            "SDXL placement check: {:.1f} / {:.1f} GB free (need >=11 GB total, >=7 GB free for full GPU).".format(
+                free / 1e9, total / 1e9,
+            ),
+            flush=True,
+        )
         return total >= 11 * 1024 ** 3 and free >= 7 * 1024 ** 3
-    except Exception:
+    except Exception as exc:
+        # This used to swallow the exception silently, which meant a user
+        # could see "CPU offload" chosen with NO "SDXL placement check: ..."
+        # line before it (the print above never running) and no way to
+        # tell whether that was VRAM genuinely being short, or
+        # mem_get_info() itself failing for some other reason (a transient
+        # CUDA/driver hiccup, contention from another process's GPU
+        # context, etc.) — those are very different problems requiring
+        # different fixes, and this was indistinguishable from the outside.
+        print("SDXL placement check failed: {}: {}".format(type(exc).__name__, exc), flush=True)
         return False
 
 
@@ -927,7 +927,6 @@ class BlobVisionEngine:
         self._caption_engine = None
         self._vqgan_loaded = False
         self._vqgan_clip_key = None
-        self._counter = 1
         self._vram = BlobVRAMCache(self)
 
         os.makedirs(self.output_dir, exist_ok=True)
@@ -1079,17 +1078,7 @@ class BlobVisionEngine:
                 self._caption_engine.unload()
                 self._caption_engine = None
             if had_vqgan:
-                print("Disconnect: unloading VQGAN + CLIP...", flush=True)
-                import generate as gen_eng
-
-                gen_eng.model = None
-                gen_eng.perceptor = None
-                if hasattr(gen_eng, "opt"):
-                    gen_eng.opt = None
-                self._vqgan_loaded = False
-                self._vqgan_clip_key = None
-                purge_generate_globals()
-                print("Disconnect: VQGAN + CLIP removed from memory.", flush=True)
+                self._unload_vqgan_clip()
             else:
                 print("Disconnect: VQGAN + CLIP was not loaded.", flush=True)
             gc.collect()
@@ -1107,6 +1096,35 @@ class BlobVisionEngine:
                     print("Disconnect: GPU cache cleared.", flush=True)
             self._vram.reset()
             print("Disconnect complete — safe to press Start for a full reload.", flush=True)
+
+    def _unload_vqgan_clip(self):
+        """Unload VQGAN+CLIP only, leaving SDXL resident if it's loaded.
+        Caller must hold self._lock. Used to swap the single non-SDXL model
+        that's kept resident when the active family changes (VQGAN <->
+        DeepDream/Style), so all three families' models are never loaded
+        at once."""
+        import gc
+        import torch
+
+        if not self._vqgan_loaded:
+            return
+        print("Unloading VQGAN + CLIP (keeping SDXL resident)...", flush=True)
+        import generate as gen_eng
+
+        gen_eng.model = None
+        gen_eng.perceptor = None
+        if hasattr(gen_eng, "opt"):
+            gen_eng.opt = None
+        self._vqgan_loaded = False
+        self._vqgan_clip_key = None
+        purge_generate_globals()
+        gc.collect()
+        if self.cuda_device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self._vram._vqgan_on_gpu = False
+        if self._vram.active == self._vram.PHASE_VQGAN:
+            self._vram.active = None
+        print("VQGAN + CLIP unloaded.", flush=True)
 
     def run_sketch_warmup(self, on_stage=None, on_progress=None):
         if self._sketch_pipe is None:
@@ -1163,7 +1181,21 @@ class BlobVisionEngine:
                 raise ValueError("prompt is required")
             prompt = "image"
 
-        width, height = resolve_aspect_size(aspect=aspect, width=width, height=height)
+        source_width = source_height = None
+        if (
+            aspect == ASPECT_CUSTOM
+            and width is None
+            and height is None
+            and init_image_path
+            and os.path.isfile(init_image_path)
+        ):
+            from PIL import Image
+            with Image.open(init_image_path) as _src:
+                source_width, source_height = _src.size
+        width, height = resolve_aspect_size(
+            aspect=aspect, width=width, height=height,
+            source_width=source_width, source_height=source_height,
+        )
 
         prompt = prompt.strip()
         negative_prompt = (negative_prompt or "").strip() or None
@@ -1187,10 +1219,12 @@ class BlobVisionEngine:
             )
 
         with self._lock:
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            slug = slugify(prompt)
-            tag = "{:04d}_{}_{}".format(self._counter, stamp, slug)
-            output_path = os.path.join(self.output_dir, tag + ".png")
+            if init_image_path and os.path.isfile(init_image_path):
+                basename_source = basename_hint_from_upload(init_image_path)
+            else:
+                basename_source = prompt
+            out_name = build_output_name("V", basename_source, ".png")
+            output_path = os.path.join(self.output_dir, out_name)
             sketch_path = None
 
             if mode == "redux":
@@ -1201,7 +1235,14 @@ class BlobVisionEngine:
                     self._vram.activate(BlobVRAMCache.PHASE_VQGAN)
                     print("Redux img2img: using provided image, skipping SDXL sketch.", flush=True)
                 else:
-                    sketch_path = os.path.join(self.output_dir, tag + "_sketch.png")
+                    # Same date/NNN/basename as the final output (out_name),
+                    # kept in sketch_dir() so outputs_dir() only shows
+                    # finished pieces — but with "V" swapped for "VSK" so the
+                    # filename itself also marks it as a sketch, not just its
+                    # folder (a sketch pulled out of sketch_dir() can no
+                    # longer collide with/overwrite the real final render).
+                    sketch_name = out_name.replace("_V_", "_VSK_", 1)
+                    sketch_path = os.path.join(sketch_dir(), sketch_name)
                     self._vram.activate(BlobVRAMCache.PHASE_SKETCH)
                     self._generate_sketch(
                         prompt, sketch_path, width, height, sketch_steps, actual_seed,
@@ -1253,7 +1294,6 @@ class BlobVisionEngine:
                 sketch_path=sketch_path,
             )
 
-            self._counter += 1
             return GenerateResult(
                 mode=mode,
                 prompt=prompt,
@@ -1421,7 +1461,6 @@ class BlobVisionEngine:
         steps=STYLE_PRESET_STEPS,
         width=None,
         height=None,
-        output_dir=None,
         on_progress=None,
     ):
         """SDXL Turbo img2img restyle — the preset-driven alternative to VGG19 Style
@@ -1450,7 +1489,13 @@ class BlobVisionEngine:
 
         with self._lock:
             pipe = self._load_sketch_img2img_pipe()
-            self._vram.note_sketch_loaded_on_gpu()
+            # No note_sketch_loaded_on_gpu() here (unlike warmup()) — this method
+            # can run after the sketch pipe has been parked to CPU by a prior
+            # VQGAN-active phase, and that call would wrongly mark it as already
+            # on GPU, making activate() skip the real transfer below and crash
+            # later with "Cannot generate a cpu tensor from a generator of type
+            # cuda". activate() alone (like generate_redux_sketch already does)
+            # correctly detects and performs the GPU move itself.
             self._vram.activate(BlobVRAMCache.PHASE_SKETCH)
             img = Image.open(image_path).convert("RGB")
             if width and height:
@@ -1473,12 +1518,8 @@ class BlobVisionEngine:
                 guidance_scale=guidance,
                 generator=generator,
             )
-            out_dir = os.path.abspath(output_dir or self.output_dir)
-            os.makedirs(out_dir, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            tag = "style_sdxl_{}_{:04d}".format(stamp, self._counter)
-            self._counter += 1
-            output_path = os.path.join(out_dir, tag + ".png")
+            out_name = build_output_name("S", final_prompt, ".png")
+            output_path = os.path.join(outputs_dir(), out_name)
             result.images[0].save(output_path)
             del result
         if on_progress:
@@ -1496,6 +1537,43 @@ class BlobVisionEngine:
         }
         return StylePresetResult(output_path=output_path, seed=int(actual_seed), metadata=meta)
 
+    def generate_style_preset_video(
+        self, video_path, prompt, strength, width, height,
+        negative_prompt=None, steps=STYLE_PRESET_STEPS, seed=None,
+        frame_step=None, on_progress=None, encode_from_sec=0.0,
+        encode_to_sec=None, use_encode_range=False,
+    ):
+        """Style Transfer's video mode when an SDXL preset is active — bypasses
+        the classic VGG19 Gatys engine (blobvision_style.py's StyleTransferEngine)
+        entirely, since a preset never touches it even for still images (see
+        /style/generate's branching). Drives the same family-agnostic pipeline
+        VQGAN's own generate_video() uses (see blobvision_video.py), with
+        generate_style_preset() (SDXL Turbo img2img, a handful of steps) as the
+        per-keyframe transform instead of VQGAN's "corrupt" mode."""
+        import shutil
+        if frame_step is None:
+            frame_step = VIDEO_FRAME_STEP
+
+        def blobify_frame(src_path, dst_path):
+            result = self.generate_style_preset(
+                image_path=src_path, prompt=prompt, strength=strength, seed=seed,
+                negative_prompt=negative_prompt, steps=steps, width=width, height=height,
+            )
+            shutil.copy2(result.output_path, dst_path)
+            # The per-keyframe still is a real, fully-named "S" file — don't
+            # let it permanently litter outputs_dir(); only the muxed final
+            # video (built by _process_video below) is meant to persist.
+            os.remove(result.output_path)
+
+        return _process_video(
+            video_path=video_path, blobify_frame=blobify_frame, width=width, height=height,
+            frame_step=frame_step, on_progress=on_progress,
+            encode_from_sec=float(encode_from_sec or 0.0), encode_to_sec=encode_to_sec,
+            use_encode_range=bool(use_encode_range),
+            type_tag="SV", basename_source=basename_hint_from_upload(video_path),
+            extra_meta={"mode": "video", "engine": "sdxl", "prompt": prompt, "strength": float(strength)},
+        )
+
     def generate_redux_sketch(
         self,
         prompt,
@@ -1504,7 +1582,6 @@ class BlobVisionEngine:
         seed,
         negative_prompt=None,
         sketch_steps=4,
-        output_dir=None,
     ):
         """SDXL Turbo sketch only (for DeepDream redux)."""
         if not prompt or not prompt.strip():
@@ -1512,12 +1589,8 @@ class BlobVisionEngine:
         with self._lock:
             self._load_sketch_pipe()
             self._vram.activate(BlobVRAMCache.PHASE_SKETCH)
-            out_dir = os.path.abspath(output_dir or self.output_dir)
-            os.makedirs(out_dir, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             sketch_path = os.path.join(
-                out_dir,
-                "sketch_{}_{:04d}.png".format(stamp, self._counter),
+                sketch_dir(), build_output_name("DSK", prompt, ".png", base_dir=sketch_dir()),
             )
             self._generate_sketch(
                 prompt.strip(),
@@ -1650,6 +1723,67 @@ class BlobVisionEngine:
         if not self.keep_models and mode != "redux":
             self._unload_sketch_pipe()
 
+    def run_vqgan_warmup(self, on_stage=None):
+        """Cheap 1-iteration VQGAN+CLIP pass so the first real generation
+        avoids CUDA kernel-selection/JIT cold-start latency — same rationale
+        as run_sketch_warmup(), but for VQGAN's own training step (CLIP
+        cutouts, VQGAN decode, backward, optimizer.step()) instead of SDXL's
+        forward pass; SDXL's warmup never exercises this half at all.
+        Measured cause: a real first VQGAN loop ran visibly slower than the
+        second one (e.g. 13s vs 7s for the same 25 iterations) with no
+        other explanation — VRAM park/unpark for VQGAN+CLIP is itself near-
+        instant (that model is small), so the gap is CUDA warming up, not
+        data movement. Output goes to a throwaway temp file, deleted right
+        after — this must never appear in the user's real output history."""
+        if not self._vqgan_loaded:
+            return
+
+        def stage(msg):
+            log_line(msg, on_stage)
+
+        stage("VQGAN warmup pass (first GPU forward+backward)...")
+        tmp_path = os.path.join(self.output_dir, ".vqgan_warmup_tmp.png")
+        with self._lock:
+            try:
+                self._vram.activate(BlobVRAMCache.PHASE_VQGAN)
+                self._run_vqgan(
+                    profile_name="redux",
+                    prompt="warmup",
+                    output_path=tmp_path,
+                    iterations=1,
+                    init_image=None,
+                    init_weight=0.0,
+                    seed=0,
+                    mode="legacy",
+                    sketch_path=None,
+                    sketch_steps=0,
+                    # No explicit sketch_size/output_size (unlike SDXL's own
+                    # warmup, which deliberately uses a small fixed size):
+                    # the redux profile's own "size" is None, so passing a
+                    # size here would be the ONLY thing setting eng.args.size
+                    # away from whatever /warmup/vqgan's earlier
+                    # _ensure_vqgan() call already left it at — which
+                    # changes _clip_key() and silently forces a real,
+                    # unnecessary reload_clip_and_cutouts() (the duplicate
+                    # "Loading CLIP OpenAI (ViT-B/16)..." line, ~3s wasted)
+                    # right before the dummy pass even starts. Leaving both
+                    # None keeps this warmup at whatever size a real
+                    # generation will actually use, which is also more
+                    # representative of the CUDA kernel shapes worth priming.
+                    sketch_size=None,
+                    output_size=None,
+                )
+            finally:
+                # Leaves the phase back at SKETCH — matches /warmup/vqgan's
+                # existing contract of leaving SDXL resident, not VQGAN.
+                self._vram.activate(BlobVRAMCache.PHASE_SKETCH)
+                if os.path.isfile(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        stage("VQGAN warmup complete")
+
     def generate_video(
         self,
         prompt,
@@ -1665,6 +1799,8 @@ class BlobVisionEngine:
         encode_to_sec=None,
         use_encode_range=False,
     ):
+        import shutil
+
         width, height = resolve_aspect_size(aspect=aspect)
         iters = clamp_iterations(
             iterations if iterations is not None else DEFAULT_ITERATIONS["video"],
@@ -1673,21 +1809,51 @@ class BlobVisionEngine:
             denoise_fidelity if denoise_fidelity is not None
             else DEFAULT_DENOISE.get("video", 0.3),
         )
+        prompt = prompt.strip()
+
+        # The one VQGAN-specific step in an otherwise generic ffmpeg/RIFE
+        # pipeline (_process_video) — runs each extracted keyframe through
+        # the ordinary "corrupt" (img2img) mode and copies the result to
+        # where _process_video expects the processed frame. Any other
+        # family's engine (DeepDream img2img, Style Transfer's Gatys loop)
+        # could drive the same pipeline by passing an equivalent closure
+        # here instead — nothing else below is VQGAN-aware.
+        def blobify_frame(src_path, dst_path):
+            result = self.generate(
+                mode="corrupt",
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                iterations=iters,
+                denoise_fidelity=denoise,
+                seed=seed,
+                init_image_path=src_path,
+                width=width,
+                height=height,
+            )
+            shutil.copy2(result.output_path, dst_path)
+            # The per-keyframe still is a real, fully-named "V" file — don't
+            # let it permanently litter outputs_dir(); only the muxed final
+            # video (built by _process_video below) is meant to persist.
+            os.remove(result.output_path)
+
         return _process_video(
-            engine=self,
             video_path=video_path,
-            prompt=prompt.strip(),
+            blobify_frame=blobify_frame,
             width=width,
             height=height,
-            iterations=iters,
-            denoise_fidelity=denoise,
-            seed=seed,
-            negative_prompt=negative_prompt,
             frame_step=frame_step,
             on_progress=on_progress,
             encode_from_sec=float(encode_from_sec or 0.0),
             encode_to_sec=encode_to_sec,
             use_encode_range=bool(use_encode_range),
+            type_tag="VV",
+            basename_source=basename_hint_from_upload(video_path),
+            extra_meta={
+                "mode": "video",
+                "prompt": prompt,
+                "iterations": iters,
+                "denoise_fidelity": denoise,
+            },
         )
 
     @staticmethod
@@ -1697,787 +1863,6 @@ class BlobVisionEngine:
     @staticmethod
     def seed_from_image(path):
         return seed_from_metadata(read_metadata_from_image(path))
-
-
-@dataclass
-class VideoResult:
-    output_path: str
-    work_dir: str
-    processed_frames: int
-    output_frames: int
-    fps: float
-    metadata: Dict[str, Any]
-
-
-def _video_log(msg, on_progress=None):
-    log_line(msg, on_progress)
-
-
-def _bundled_codec_exe(subdir, names):
-    base = os.path.join(VIDEO_CODECS_ROOT, subdir)
-    for name in names:
-        path = os.path.join(base, name)
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def _resolve_codec_tool(env_key, subdir, names, path_names):
-    env = os.environ.get(env_key, "").strip()
-    if env and os.path.isfile(env):
-        return env
-    bundled = _bundled_codec_exe(subdir, names)
-    if bundled:
-        return bundled
-    import shutil
-    for name in path_names:
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
-
-
-def video_codecs_status():
-    ffmpeg = _resolve_codec_tool(
-        "BLOBVISION_FFMPEG_BIN", "ffmpeg", ("ffmpeg.exe", "ffmpeg"), ("ffmpeg",),
-    )
-    ffprobe = _resolve_codec_tool(
-        "BLOBVISION_FFPROBE_BIN", "ffmpeg", ("ffprobe.exe", "ffprobe"), ("ffprobe",),
-    )
-    rife = _resolve_codec_tool(
-        "BLOBVISION_RIFE_BIN", "rife",
-        ("rife-ncnn-vulkan.exe", "rife-ncnn-vulkan"),
-        ("rife-ncnn-vulkan",),
-    )
-    bundled_ffmpeg = _bundled_codec_exe("ffmpeg", ("ffmpeg.exe", "ffmpeg"))
-    bundled_ffprobe = _bundled_codec_exe("ffmpeg", ("ffprobe.exe", "ffprobe"))
-    bundled_rife = _bundled_codec_exe("rife", ("rife-ncnn-vulkan.exe", "rife-ncnn-vulkan"))
-    return {
-        "ffmpeg": ffmpeg,
-        "ffprobe": ffprobe,
-        "rife": rife,
-        "bundled_root": VIDEO_CODECS_ROOT,
-        "ready": bool(ffmpeg and ffprobe),
-        "bundled_ready": bool(bundled_ffmpeg and bundled_ffprobe),
-        "bundled_rife": bool(bundled_rife),
-    }
-
-
-def _resolve_ffmpeg():
-    path = _resolve_codec_tool(
-        "BLOBVISION_FFMPEG_BIN", "ffmpeg", ("ffmpeg.exe", "ffmpeg"), ("ffmpeg",),
-    )
-    if not path:
-        raise RuntimeError(
-            "ffmpeg not found. Run Setup Video Codecs.bat in the repo root once "
-            "(creates video-codecs/ffmpeg/), or install ffmpeg in PATH.",
-        )
-    return path
-
-
-def _resolve_ffprobe():
-    path = _resolve_codec_tool(
-        "BLOBVISION_FFPROBE_BIN", "ffmpeg", ("ffprobe.exe", "ffprobe"), ("ffprobe",),
-    )
-    if not path:
-        raise RuntimeError(
-            "ffprobe not found. Run Setup Video Codecs.bat or install ffmpeg in PATH.",
-        )
-    return path
-
-
-def _resolve_rife():
-    rife = _resolve_codec_tool(
-        "BLOBVISION_RIFE_BIN", "rife",
-        ("rife-ncnn-vulkan.exe", "rife-ncnn-vulkan"),
-        ("rife-ncnn-vulkan",),
-    )
-    if rife:
-        _repair_rife_model_layout(rife)
-    return rife
-
-
-def setup_bundled_video_codecs(force=False):
-    """Download ffmpeg + RIFE into video-codecs/ (Windows x64). Run once per machine."""
-    import shutil
-    import tempfile
-    import urllib.request
-    import zipfile
-
-    ffmpeg_dir = os.path.join(VIDEO_CODECS_ROOT, "ffmpeg")
-    rife_dir = os.path.join(VIDEO_CODECS_ROOT, "rife")
-    os.makedirs(ffmpeg_dir, exist_ok=True)
-    os.makedirs(rife_dir, exist_ok=True)
-
-    readme = os.path.join(VIDEO_CODECS_ROOT, "README.txt")
-    if not os.path.isfile(readme):
-        with open(readme, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(
-                "BlobVision bundled video tools (auto-downloaded, not in git).\n"
-                "ffmpeg/  — decode, encode, motion interpolation\n"
-                "rife/    — optional AI frame interpolation (smoother than ffmpeg alone)\n"
-                "Re-run Setup Video Codecs.bat to refresh.\n",
-            )
-
-    ffmpeg_ok = _bundled_codec_exe("ffmpeg", ("ffmpeg.exe", "ffmpeg"))
-    ffprobe_ok = _bundled_codec_exe("ffmpeg", ("ffprobe.exe", "ffprobe"))
-    rife_ok = _bundled_codec_exe("rife", ("rife-ncnn-vulkan.exe", "rife-ncnn-vulkan"))
-
-    if sys.platform != "win32":
-        print(
-            "Setup Video Codecs: auto-download is Windows-only. "
-            "Install ffmpeg + optional rife-ncnn-vulkan, or copy binaries into video-codecs/.",
-            flush=True,
-        )
-        return video_codecs_status()
-
-    FFMPEG_URL = (
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-        "ffmpeg-master-latest-win64-gpl.zip"
-    )
-    RIFE_URL = (
-        "https://github.com/nihui/rife-ncnn-vulkan/releases/download/20221029/"
-        "rife-ncnn-vulkan-20221029-windows.zip"
-    )
-
-    def _download_zip(url, label):
-        print("Downloading {}...".format(label), flush=True)
-        tmp = tempfile.mkdtemp(prefix="blobcodecs_")
-        zip_path = os.path.join(tmp, "pkg.zip")
-        try:
-            urllib.request.urlretrieve(url, zip_path)
-            return zip_path, tmp
-        except Exception:
-            shutil.rmtree(tmp, ignore_errors=True)
-            raise
-
-    if force or not (ffmpeg_ok and ffprobe_ok):
-        zip_path, tmp = _download_zip(FFMPEG_URL, "ffmpeg (~100 MB)")
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for member in zf.namelist():
-                    base = os.path.basename(member)
-                    if base in ("ffmpeg.exe", "ffprobe.exe"):
-                        dest = os.path.join(ffmpeg_dir, base)
-                        with zf.open(member) as src, open(dest, "wb") as dst:
-                            dst.write(src.read())
-            print("ffmpeg installed -> {}".format(ffmpeg_dir), flush=True)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    else:
-        print("ffmpeg already present in video-codecs/ffmpeg/", flush=True)
-
-    if force or not rife_ok:
-        zip_path, tmp = _download_zip(RIFE_URL, "RIFE ncnn (~40 MB)")
-        try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for member in zf.namelist():
-                    if member.endswith("/"):
-                        continue
-                    norm = member.replace("\\", "/")
-                    parts = [p for p in norm.split("/") if p]
-                    if not parts:
-                        continue
-                    if parts[0].lower().startswith("rife-ncnn") and len(parts) > 1:
-                        rel_parts = parts[1:]
-                    else:
-                        rel_parts = parts
-                    dest = os.path.join(rife_dir, *rel_parts)
-                    os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    with zf.open(member) as src, open(dest, "wb") as dst:
-                        dst.write(src.read())
-            rife_exe = os.path.join(rife_dir, "rife-ncnn-vulkan.exe")
-            if os.path.isfile(rife_exe):
-                _repair_rife_model_layout(rife_exe)
-            print("RIFE installed -> {}".format(rife_dir), flush=True)
-            model = _rife_pick_model(rife_exe)
-            v4 = _rife_pick_v4_model(rife_exe)
-            if model:
-                print("RIFE model detected: {}".format(model), flush=True)
-            else:
-                print(
-                    "WARNING: RIFE binary OK but no flownet.param in rife-v2.3/ etc. "
-                    "Re-run Setup Video Codecs.bat with --force.",
-                    flush=True,
-                )
-            if v4:
-                print("RIFE v4 model available for 4x interpolation: {}".format(v4), flush=True)
-            elif model:
-                print("RIFE 4x will use chained 2x passes (no v4 model folder).", flush=True)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    else:
-        print("RIFE already present in video-codecs/rife/", flush=True)
-
-    status = video_codecs_status()
-    print("Video codecs ready: ffmpeg={}, rife={}".format(
-        bool(status["ffmpeg"]), bool(status["rife"]),
-    ), flush=True)
-    return status
-
-
-def _find_tool(name):
-    if name == "ffmpeg":
-        return _resolve_ffmpeg()
-    if name == "ffprobe":
-        return _resolve_ffprobe()
-    import shutil
-    path = shutil.which(name)
-    if not path:
-        raise RuntimeError("{} not found.".format(name))
-    return path
-
-
-def format_video_duration(seconds):
-    seconds = max(0.0, float(seconds))
-    if seconds >= 3600:
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = seconds % 60
-        return "{}h {:02d}m {:.1f}s".format(hours, minutes, secs)
-    if seconds >= 60:
-        minutes = int(seconds // 60)
-        secs = seconds % 60
-        return "{}m {:.1f}s".format(minutes, secs)
-    return "{:.1f}s".format(seconds)
-
-
-def probe_video_file(video_path):
-    return _probe_video(video_path)
-
-
-def _probe_video(video_path):
-    import json
-    import subprocess
-    ffprobe = _find_tool("ffprobe")
-    raw = subprocess.check_output([
-        ffprobe, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
-        "-show_entries", "format=duration", "-of", "json", video_path,
-    ], text=True)
-    data = json.loads(raw)
-    stream = (data.get("streams") or [{}])[0]
-    fmt = data.get("format") or {}
-
-    def _rate(value):
-        if not value or value == "0/0":
-            return 0.0
-        if "/" in value:
-            num, den = value.split("/", 1)
-            return float(num) / (float(den) or 1.0)
-        return float(value)
-
-    duration = float(stream.get("duration") or fmt.get("duration") or 0.0)
-    fps = _rate(stream.get("avg_frame_rate"))
-    if fps <= 0.0 or fps > 120.0:
-        fps = _rate(stream.get("r_frame_rate"))
-    nb_frames = stream.get("nb_frames")
-    if nb_frames and duration > 0:
-        computed = float(nb_frames) / duration
-        if 5.0 < computed < 120.0:
-            fps = computed
-    if fps <= 0.0 or fps > 120.0:
-        fps = 24.0
-    width = int(stream.get("width") or 0)
-    height = int(stream.get("height") or 0)
-    if width <= 0 or height <= 0:
-        width, height = 1920, 1080
-    frame_count = int(nb_frames) if nb_frames else 0
-    return {
-        "fps": fps,
-        "duration": duration,
-        "width": width,
-        "height": height,
-        "frame_count": frame_count,
-    }
-
-
-def _extract_video_frames(
-    video_path, out_dir, size, start_sec=0.0, duration_sec=None,
-    output_fps=None, on_progress=None,
-):
-    """Extract frames from a clip; optional output_fps thins by time (not decode index)."""
-    import subprocess
-
-    os.makedirs(out_dir, exist_ok=True)
-    for stale in os.listdir(out_dir):
-        if stale.lower().endswith(".png"):
-            os.remove(os.path.join(out_dir, stale))
-    w, h = size
-    pattern = os.path.join(out_dir, "src_%06d.png")
-    scale_crop = "scale={}:{}:force_original_aspect_ratio=increase,crop={}:{}".format(w, h, w, h)
-    if output_fps and float(output_fps) > 0.0:
-        vf = "fps={:.6f},{}".format(float(output_fps), scale_crop)
-        rate_note = " at {:.3f} fps".format(float(output_fps))
-    else:
-        vf = scale_crop
-        rate_note = " (full decode)"
-    cmd = [_find_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error"]
-    if start_sec and float(start_sec) > 0:
-        cmd.extend(["-ss", str(float(start_sec))])
-    cmd.extend(["-i", video_path])
-    if duration_sec is not None and float(duration_sec) > 0:
-        cmd.extend(["-t", str(float(duration_sec))])
-    cmd.extend(["-vf", vf, "-fps_mode", "vfr", pattern])
-    _video_log("Video: extracting keyframes{} — {}".format(rate_note, " ".join(cmd)), on_progress)
-    subprocess.check_call(cmd)
-    frames = sorted(
-        os.path.join(out_dir, n) for n in os.listdir(out_dir) if n.lower().endswith(".png")
-    )
-    if not frames:
-        raise RuntimeError("No frames extracted from video.")
-    return frames
-
-
-def _rife_workdir(rife_exe):
-    return os.path.dirname(os.path.abspath(rife_exe))
-
-
-def _repair_rife_model_layout(rife_exe):
-    """Older installs flattened *.param/*.bin next to the exe; ncnn expects rife-v2.3/."""
-    import shutil
-
-    model_dir = _rife_workdir(rife_exe)
-    flat_param = os.path.join(model_dir, "flownet.param")
-    target = os.path.join(model_dir, "rife-v2.3")
-    if not os.path.isfile(flat_param):
-        return False
-    if os.path.isfile(os.path.join(target, "flownet.param")):
-        return True
-    os.makedirs(target, exist_ok=True)
-    for name in os.listdir(model_dir):
-        lower = name.lower()
-        if not lower.endswith((".param", ".bin")):
-            continue
-        src = os.path.join(model_dir, name)
-        dst = os.path.join(target, name)
-        if os.path.isfile(src) and not os.path.exists(dst):
-            shutil.move(src, dst)
-    return os.path.isfile(os.path.join(target, "flownet.param"))
-
-
-def _rife_pick_model(rife_exe):
-    model_dir = _rife_workdir(rife_exe)
-    for name in ("rife-v4.6", "rife-v4", "rife-v2.3", "rife-v2"):
-        sub = os.path.join(model_dir, name)
-        if os.path.isfile(os.path.join(sub, "flownet.param")):
-            return name
-        if os.path.isfile(os.path.join(model_dir, name + ".param")):
-            return name
-    return None
-
-
-def _rife_pick_v4_model(rife_exe):
-    model_dir = _rife_workdir(rife_exe)
-    for name in ("rife-v4.6", "rife-v4"):
-        if os.path.isfile(os.path.join(model_dir, name, "flownet.param")):
-            return name
-    return None
-
-
-def _list_rife_pngs(output_dir):
-    frames = []
-    for root, _dirs, files in os.walk(output_dir):
-        for name in files:
-            if name.lower().endswith(".png"):
-                frames.append(os.path.join(root, name))
-    return sorted(frames)
-
-
-def _rife_target_frame_count(input_count, multiplier):
-    n_in = max(2, int(input_count))
-    mult = max(2, int(multiplier))
-    n_between = mult - 1
-    return n_in * mult - n_between
-
-
-def _run_rife_pass(rife_exe, input_dir, output_dir, on_progress=None, model=None, target_frames=None):
-    import subprocess
-    import shutil
-
-    os.makedirs(output_dir, exist_ok=True)
-    for stale in os.listdir(output_dir):
-        path = os.path.join(output_dir, stale)
-        if os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
-        elif stale.lower().endswith(".png"):
-            os.remove(path)
-    cmd = [
-        rife_exe,
-        "-i", input_dir,
-        "-o", output_dir,
-        "-f", "out_%06d.png",
-    ]
-    if model is None:
-        model = _rife_pick_model(rife_exe)
-    if model:
-        cmd.extend(["-m", model])
-    if target_frames is not None:
-        cmd.extend(["-n", str(int(target_frames))])
-    _video_log("Video: RIFE running — " + " ".join(cmd), on_progress)
-    proc = subprocess.run(
-        cmd,
-        cwd=_rife_workdir(rife_exe),
-        capture_output=True,
-        text=True,
-    )
-    tail = (proc.stderr or proc.stdout or "").strip()
-    if tail:
-        for line in tail.splitlines()[-3:]:
-            _video_log("Video: RIFE: " + line.strip(), on_progress)
-    frames = _list_rife_pngs(output_dir)
-    if proc.returncode != 0 or not frames:
-        return None
-    _video_log("Video: RIFE produced {} frames.".format(len(frames)), on_progress)
-    return frames
-
-
-def _interpolate_video_frames_rife(input_dir, output_dir, multiplier, on_progress=None):
-    import shutil
-    import tempfile
-
-    os.makedirs(output_dir, exist_ok=True)
-    rife = _resolve_rife()
-    if not rife:
-        return None
-    input_count = len([
-        name for name in os.listdir(input_dir)
-        if name.lower().endswith(".png")
-    ])
-    if input_count < 2:
-        return None
-    multiplier = max(2, int(multiplier))
-    _video_log(
-        "Video: RIFE AI interpolation x{} ({} keyframes in)...".format(
-            multiplier, input_count,
-        ),
-        on_progress,
-    )
-    v4_model = _rife_pick_v4_model(rife)
-    if v4_model and multiplier > 2:
-        target = _rife_target_frame_count(input_count, multiplier)
-        out = _run_rife_pass(
-            rife, input_dir, output_dir, on_progress=on_progress,
-            model=v4_model, target_frames=target,
-        )
-        if out:
-            return out
-        _video_log(
-            "Video: RIFE v4 pass failed — trying chained 2x passes...",
-            on_progress,
-        )
-    if multiplier <= 2:
-        return _run_rife_pass(rife, input_dir, output_dir, on_progress=on_progress)
-    passes = int(round(math.log2(multiplier))) if multiplier > 2 else 1
-    passes = max(1, passes)
-    current_in = input_dir
-    temp_dirs = []
-    result = None
-    try:
-        for pass_idx in range(passes):
-            if pass_idx == passes - 1:
-                out_dir = output_dir
-            else:
-                out_dir = tempfile.mkdtemp(prefix="rife_pass_", dir=os.path.dirname(output_dir))
-                temp_dirs.append(out_dir)
-            _video_log(
-                "Video: RIFE 2x pass {}/{}...".format(pass_idx + 1, passes),
-                on_progress,
-            )
-            result = _run_rife_pass(rife, current_in, out_dir, on_progress=on_progress)
-            if not result:
-                return None
-            current_in = out_dir
-        return result
-    finally:
-        for temp_dir in temp_dirs:
-            if temp_dir != output_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def _assemble_video_interpolated(
-    proc_dir, output_path, keyframe_count, target_frame_count, clip_duration, on_progress=None,
-):
-    import subprocess
-
-    ffmpeg = _resolve_ffmpeg()
-    clip_duration = max(0.05, float(clip_duration))
-    keyframe_count = max(1, int(keyframe_count))
-    target_frame_count = max(keyframe_count + 1, int(target_frame_count))
-    sparse_fps = keyframe_count / clip_duration
-    out_fps = target_frame_count / clip_duration
-    pattern = os.path.join(proc_dir, "proc_%06d.png")
-    vf = "minterpolate=fps={:.3f}:mi_mode=mci:mc_mode=aobmc".format(out_fps)
-    _video_log(
-        "Video: ffmpeg motion interpolation {} keyframes -> {} frames ({:.1f} -> {:.1f} fps)...".format(
-            keyframe_count, target_frame_count, sparse_fps, out_fps,
-        ),
-        on_progress,
-    )
-    subprocess.check_call([
-        ffmpeg, "-y",
-        "-framerate", str(sparse_fps),
-        "-i", pattern,
-        "-vf", vf,
-        "-frames:v", str(target_frame_count),
-        "-pix_fmt", "yuv420p",
-        output_path,
-    ])
-
-
-def _interpolate_to_target_count(input_dir, output_dir, target_frames, on_progress=None):
-    import shutil
-
-    existing = sorted(
-        os.path.join(input_dir, name)
-        for name in os.listdir(input_dir)
-        if name.lower().endswith(".png")
-    )
-    in_count = len(existing)
-    target = max(2, int(target_frames))
-    if in_count < 2:
-        return None
-    if in_count >= target:
-        os.makedirs(output_dir, exist_ok=True)
-        for idx, src in enumerate(existing[:target]):
-            shutil.copy2(src, os.path.join(output_dir, "out_{:06d}.png".format(idx + 1)))
-        return existing[:target]
-    multiplier = max(2, int((target + in_count - 2) // max(1, in_count - 1)))
-    _video_log(
-        "Video: RIFE stretch {} keyframes -> {} frames...".format(in_count, target),
-        on_progress,
-    )
-    rife_out = _interpolate_video_frames_rife(
-        input_dir, output_dir, multiplier, on_progress=on_progress,
-    )
-    if not rife_out:
-        return None
-    trimmed = sorted(_list_rife_pngs(output_dir))[:target]
-    os.makedirs(output_dir, exist_ok=True)
-    for idx, src in enumerate(trimmed):
-        dest = os.path.join(output_dir, "out_{:06d}.png".format(idx + 1))
-        if os.path.abspath(src) != os.path.abspath(dest):
-            shutil.copy2(src, dest)
-    return trimmed
-
-
-def _interpolate_video_frames(input_dir, output_dir, multiplier, fps, on_progress=None, target_frames=None):
-    if target_frames is not None:
-        rife_out = _interpolate_to_target_count(
-            input_dir, output_dir, target_frames, on_progress=on_progress,
-        )
-        if rife_out:
-            return rife_out
-    else:
-        rife_out = _interpolate_video_frames_rife(input_dir, output_dir, multiplier, on_progress)
-        if rife_out:
-            return rife_out
-    _video_log(
-        "Video: RIFE unavailable or failed — using ffmpeg minterpolate instead.",
-        on_progress,
-    )
-    return None
-
-
-def _assemble_video(frame_dir, output_path, fps, frame_glob="out_%06d.png"):
-    import subprocess
-    subprocess.check_call([
-        _find_tool("ffmpeg"), "-y", "-framerate", str(float(fps)),
-        "-i", os.path.join(frame_dir, frame_glob),
-        "-pix_fmt", "yuv420p", output_path,
-    ])
-
-
-def _mux_video_audio(source_video, silent_video, output_path, clip_start=0.0, clip_duration=None):
-    import subprocess
-    cmd = [
-        _find_tool("ffmpeg"), "-y",
-        "-i", silent_video,
-    ]
-    if clip_start and float(clip_start) > 0:
-        cmd.extend(["-ss", str(float(clip_start))])
-    cmd.extend(["-i", source_video])
-    if clip_duration is not None and float(clip_duration) > 0:
-        cmd.extend(["-t", str(float(clip_duration))])
-    cmd.extend([
-        "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "copy", "-c:a", "aac", "-shortest",
-        output_path,
-    ])
-    subprocess.check_call(cmd)
-
-
-def _process_video(
-    engine, video_path, prompt, width, height, iterations,
-    denoise_fidelity, seed=None, negative_prompt=None, frame_step=4, on_progress=None,
-    encode_from_sec=0.0, encode_to_sec=None, use_encode_range=False,
-):
-    import blobvision_cancel
-    import shutil
-
-    video_path = os.path.abspath(video_path)
-    if not os.path.isfile(video_path):
-        raise RuntimeError("Video file not found: " + video_path)
-    codecs = video_codecs_status()
-    if not codecs["ready"]:
-        raise RuntimeError(
-            "Video codecs missing. Click Install codecs in BlobVision or run Setup Video Codecs.bat.",
-        )
-    info = _probe_video(video_path)
-    duration = float(info["duration"])
-    if use_encode_range:
-        encode_from = max(0.0, float(encode_from_sec or 0.0))
-        encode_to = float(encode_to_sec if encode_to_sec is not None else duration)
-        encode_to = min(duration, max(encode_from + 0.05, encode_to))
-    else:
-        encode_from = 0.0
-        encode_to = duration
-    clip_duration = encode_to - encode_from
-    if clip_duration <= 0:
-        raise RuntimeError("Invalid encode range: end must be after start.")
-
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    work_dir = os.path.join(engine.output_dir, "video_{}".format(stamp))
-    src_dir = os.path.join(work_dir, "src")
-    proc_dir = os.path.join(work_dir, "processed")
-    interp_dir = os.path.join(work_dir, "interpolated")
-    os.makedirs(work_dir, exist_ok=True)
-    os.makedirs(proc_dir, exist_ok=True)
-    frame_step = max(1, int(frame_step))
-    step_label = "all frames" if frame_step == 1 else "1 every {} frames".format(frame_step)
-    source_fps = float(info["fps"])
-    decoded_fps = None
-    if info.get("frame_count") and clip_duration > 0:
-        decoded_fps = float(info["frame_count"]) / clip_duration
-    effective_source_fps = source_fps
-    if decoded_fps and decoded_fps > source_fps + 1.0:
-        effective_source_fps = decoded_fps
-    working_fps = _normalize_working_fps(effective_source_fps)
-    fps_normalized = working_fps < effective_source_fps - 0.5
-    working_video = video_path
-    extract_from = encode_from
-    if fps_normalized:
-        norm_path = os.path.join(work_dir, "normalized.mp4")
-        _normalize_video_clip(
-            video_path, norm_path, encode_from, clip_duration, working_fps,
-            on_progress=on_progress,
-        )
-        working_video = norm_path
-        extract_from = 0.0
-        _video_log(
-            "Video: input {:.1f} fps -> {:.1f} fps before extract (24/25/30 max).".format(
-                effective_source_fps, working_fps,
-            ),
-            on_progress,
-        )
-    _video_log(
-        "Video: {:.1f}s -> {:.1f}s, {} at {}x{} (stride={})...".format(
-            encode_from, encode_to, step_label, width, height, frame_step,
-        ),
-        on_progress,
-    )
-    native_frames = _extract_video_frames(
-        working_video, src_dir, (width, height),
-        start_sec=extract_from, duration_sec=clip_duration, on_progress=on_progress,
-    )
-    native_count = len(native_frames)
-    timeline_fps = native_count / clip_duration if clip_duration > 0 else float(info["fps"])
-    target_output_frames = native_count
-    keyframes = _subsample_frame_paths(native_frames, frame_step)
-    _video_log(
-        "Video: {} frames in clip -> {} to blobify (VQGAN), then RIFE/ffmpeg -> {} frames.".format(
-            native_count, len(keyframes), target_output_frames,
-        ),
-        on_progress,
-    )
-    if frame_step > 1 and len(keyframes) >= native_count:
-        raise RuntimeError(
-            "Frame thinning failed: stride={} but all {} frames would be blobified.".format(
-                frame_step, native_count,
-            ),
-        )
-    for index, frame_path in enumerate(keyframes):
-        if blobvision_cancel.is_requested():
-            raise blobvision_cancel.AbortedError("Video processing aborted")
-        _video_log("Video: blobify {}/{}...".format(index + 1, len(keyframes)), on_progress)
-        out_path = os.path.join(proc_dir, "proc_{:06d}.png".format(index))
-        result = engine.generate(
-            mode="corrupt",
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            iterations=iterations,
-            denoise_fidelity=denoise_fidelity,
-            seed=seed,
-            init_image_path=frame_path,
-            width=width,
-            height=height,
-        )
-        shutil.copy2(result.output_path, out_path)
-    silent_path = os.path.join(work_dir, "silent.mp4")
-    if frame_step <= 1:
-        _video_log(
-            "Video: all frames blobified — assembling at {:.2f} fps (no interpolation).".format(
-                timeline_fps,
-            ),
-            on_progress,
-        )
-        _assemble_video(proc_dir, silent_path, timeline_fps, frame_glob="proc_%06d.png")
-        interp_frames = keyframes
-    else:
-        interp_frames = _interpolate_video_frames(
-            proc_dir, interp_dir, frame_step, timeline_fps,
-            on_progress=on_progress, target_frames=target_output_frames,
-        )
-        if interp_frames:
-            _video_log(
-                "Video: assembling {} interpolated frames at {:.2f} fps...".format(
-                    len(interp_frames), timeline_fps,
-                ),
-                on_progress,
-            )
-            _assemble_video(interp_dir, silent_path, timeline_fps)
-        else:
-            _assemble_video_interpolated(
-                proc_dir, silent_path, len(keyframes), target_output_frames, clip_duration,
-                on_progress=on_progress,
-            )
-            interp_frames = []
-    final_path = os.path.join(engine.output_dir, "video_{}.mp4".format(stamp))
-    _mux_video_audio(
-        video_path, silent_path, final_path,
-        clip_start=encode_from, clip_duration=clip_duration,
-    )
-    meta = {
-        "mode": "video",
-        "prompt": prompt,
-        "source_video": video_path,
-        "output_video": final_path,
-        "work_dir": work_dir,
-        "fps": timeline_fps,
-        "source_fps": source_fps,
-        "working_fps": working_fps,
-        "fps_normalized": fps_normalized,
-        "native_frames": native_count,
-        "duration": duration,
-        "encode_from_sec": encode_from,
-        "encode_to_sec": encode_to,
-        "use_encode_range": bool(use_encode_range),
-        "frame_step": frame_step,
-        "processed_frames": len(keyframes),
-        "output_frames": len(interp_frames) if interp_frames else target_output_frames,
-        "size": [width, height],
-        "iterations": iterations,
-        "denoise_fidelity": denoise_fidelity,
-    }
-    _video_log("Video: done — " + final_path, on_progress)
-    return VideoResult(
-        output_path=final_path,
-        work_dir=work_dir,
-        processed_frames=len(keyframes),
-        output_frames=len(interp_frames) if interp_frames else target_output_frames,
-        fps=timeline_fps,
-        metadata=meta,
-    )
 
 
 if __name__ == "__main__":

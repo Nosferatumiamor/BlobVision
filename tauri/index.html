@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>BlobVision</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <header id="top-bar">
+      <div class="brand">
+        <img src="/src/blob-logo.png" alt="" class="blob-logo" />
+        <div>
+          <h1>BlobVision</h1>
+          <p class="tagline">Retro AI Slop Emulator</p>
+        </div>
+        <button id="studio-btn" type="button">Meme studio</button>
+      </div>
+      <nav id="family-switcher">
+        <button class="family-btn active" data-family="vqgan">VQGAN+CLIP</button>
+        <button class="family-btn" data-family="deepdream">DeepDream</button>
+        <button class="family-btn" data-family="style">Style Transfer</button>
+      </nav>
+      <div id="engine-status" class="status status-pending">Checking engine...</div>
+    </header>
+
+    <main id="layout">
+      <aside id="sidebar">
+        <div class="field" id="vqgan-mode-field">
+          <span class="field-label">Mode</span>
+          <div class="radio-row" id="mode-radio">
+            <label><input type="radio" name="mode" value="redux" checked /> redux</label>
+            <label><input type="radio" name="mode" value="legacy" /> legacy</label>
+          </div>
+          <p class="field-hint" id="mode-blurb">SDXL sketch → VQGAN blob. Fast default.</p>
+        </div>
+        <p class="field-hint" id="dd-blurb" hidden>
+          Prompt → SDXL sketch → DeepDream. Or drop an image for img2img.
+        </p>
+
+        <button id="generate-btn" type="button">DEGENERATE</button>
+
+        <div id="prompt-fields">
+          <label class="field">
+            <span class="field-label">Prompt</span>
+            <div class="prompt-input-wrap">
+              <textarea id="prompt" rows="2" placeholder="Describe SLOP"></textarea>
+              <button id="prompt-grimoire-btn" class="grimoire-arrow-btn" title="Warlock's Grimoire" type="button">▾</button>
+            </div>
+          </label>
+
+          <label class="field">
+            <span class="field-label">Negative prompt</span>
+            <div class="prompt-input-wrap">
+              <input id="negative-prompt" type="text" placeholder="Separate slop with commas" />
+              <button id="negative-grimoire-btn" class="grimoire-arrow-btn" title="Warlock's Grimoire" type="button">▾</button>
+            </div>
+          </label>
+        </div>
+
+        <div class="field-row" id="format-grimoire-row">
+          <div class="dropdown-field">
+            <button id="format-btn" class="menu-btn" type="button">FORMAT: <span id="format-btn-value">1:1</span> ▾</button>
+          </div>
+          <button id="grimoire-btn" class="menu-btn" type="button">GRIMOIRE</button>
+        </div>
+
+        <div id="vqgan-only-fields">
+          <label class="field">
+            <span class="field-label">
+              Steps/Blob
+              <span id="iterations-value" class="field-value">25</span>
+            </span>
+            <input id="iterations" type="range" min="0" max="100" step="1" value="25" />
+          </label>
+
+          <label class="field" id="denoise-field">
+            <span class="field-label">
+              Deslop
+              <span id="denoise-value" class="field-value">0.50</span>
+            </span>
+            <input id="denoise" type="range" min="0" max="1" step="0.05" value="0.5" />
+          </label>
+
+        </div>
+
+        <div id="deepdream-only-fields" hidden>
+          <div class="field">
+            <span class="field-label">Inception layer</span>
+            <div class="radio-row" id="dd-layer-radio">
+              <label><input type="radio" name="dd-layer" value="mixed5b" /> mixed5b</label>
+              <label><input type="radio" name="dd-layer" value="mixed6a" checked /> mixed6a</label>
+              <label><input type="radio" name="dd-layer" value="mixed7" /> mixed7</label>
+            </div>
+            <p class="field-hint">mixed5b = faces; mixed6a = best default; mixed7 = abstract.</p>
+          </div>
+
+          <label class="field">
+            <span class="field-label">
+              Intensity
+              <span id="dd-intensity-value" class="field-value">50</span>
+            </span>
+            <input id="dd-intensity" type="range" min="0" max="100" step="5" value="50" />
+          </label>
+        </div>
+
+        <div id="style-only-fields" hidden>
+          <label class="field" id="style-custom-prompt-field" hidden>
+            <span class="field-label">Custom prompt</span>
+            <input id="style-custom-prompt" type="text" placeholder="Describe the style to restyle into..." />
+          </label>
+
+          <div id="style-classic-fields">
+            <div class="field">
+              <span class="field-label">Style reference</span>
+              <div id="style-image-drop" class="drop-zone">
+                <span id="style-image-hint">Drop pics here</span>
+                <img id="style-image-preview" alt="" hidden />
+                <input id="style-image" type="file" accept="image/*" />
+                <button id="style-image-clear" class="corner-icon-btn corner-icon-btn-left" title="Remove" hidden type="button">×</button>
+                <button id="style-image-copy" class="corner-icon-btn corner-icon-btn-right-2" title="Copy" hidden type="button">⧉</button>
+                <button id="style-image-download" class="corner-icon-btn corner-icon-btn-right" title="Download" hidden type="button">⬇</button>
+              </div>
+            </div>
+
+            <label class="field">
+              <span class="field-label">
+                Style strength
+                <span id="style-strength-value" class="field-value">1.00</span>
+              </span>
+              <input id="style-strength" type="range" min="0.1" max="2.0" step="0.05" value="1.0" />
+            </label>
+
+            <label class="field">
+              <span class="field-label">
+                Content fidelity
+                <span id="content-weight-value" class="field-value">1.00</span>
+              </span>
+              <input id="content-weight" type="range" min="0.1" max="2.0" step="0.05" value="1.0" />
+            </label>
+
+            <label class="field">
+              <span class="field-label">
+                Steps
+                <span id="style-steps-value" class="field-value">300</span>
+              </span>
+              <input id="style-steps" type="range" min="50" max="500" step="10" value="300" />
+            </label>
+          </div>
+        </div>
+
+        <div class="checkbox-row" id="upscale-row">
+          <label class="checkbox-field"><input id="upscale-2x" type="checkbox" /> Upscale x2</label>
+          <label class="checkbox-field"><input id="upscale-4x" type="checkbox" /> Upscale x4</label>
+        </div>
+      </aside>
+
+      <section id="preview">
+        <div id="preview-main">
+          <div id="output-canvas">
+            <p id="output-hint">
+              Selecting a family while SDXL loads (~5s after warmup) decides which model
+              loads next to it. Switching families after that loads nothing by itself —
+              hit Degenerate once in a different family to swap its model in.
+            </p>
+            <img id="output-image" alt="" hidden />
+            <video id="output-video" hidden controls></video>
+            <button id="output-clear" class="corner-icon-btn corner-icon-btn-left" title="Remove" type="button">×</button>
+            <button id="use-as-init-btn" class="corner-icon-btn corner-icon-btn-left-2" title="Use as init image" type="button">➤</button>
+            <button id="copy-btn" class="corner-icon-btn corner-icon-btn-right-2" title="Copy" type="button">⧉</button>
+            <button id="download-btn" class="corner-icon-btn corner-icon-btn-right" title="Download" type="button">⬇</button>
+          </div>
+          <div id="gen-status" class="status status-pending" hidden>
+            <div id="gen-status-fill"></div>
+            <span id="gen-status-text"></span>
+          </div>
+        </div>
+
+        <div id="preview-side">
+          <div id="preview-side-actions">
+            <button id="gallery-btn" type="button">Gallery</button>
+            <button id="cancel-btn" type="button">Cancel</button>
+          </div>
+
+          <div class="field">
+            <span class="field-label">
+              img2img
+              <span class="checkbox-inline"><input id="init-image-reuse" type="checkbox" /> reuse img</span>
+            </span>
+            <div id="init-image-drop" class="drop-zone">
+              <span id="init-image-hint">Drop pics or clips here</span>
+              <img id="init-image-preview" alt="" hidden />
+              <video id="init-video-preview" hidden muted controls></video>
+              <canvas id="sam-mask-canvas"></canvas>
+              <input id="init-image" type="file" accept="image/*,video/*" />
+              <button id="init-image-clear" class="corner-icon-btn corner-icon-btn-left" title="Remove" type="button">×</button>
+              <button id="init-image-paste" class="corner-icon-btn corner-icon-btn-left-2" title="Paste" type="button">📋</button>
+              <button id="init-image-copy" class="corner-icon-btn corner-icon-btn-right-2" title="Copy" type="button">⧉</button>
+              <button id="init-image-download" class="corner-icon-btn corner-icon-btn-right" title="Download" type="button">⬇</button>
+            </div>
+            <p class="field-hint" id="video-probe-hint"></p>
+            <div class="checkbox-row" id="sam-toggle-row" hidden>
+              <button id="sam-wand-btn" type="button" title="Select a segment on the image">🪄 Magic wand</button>
+              <button id="sam-clear-btn" type="button" title="Clear the current mask" disabled>Clear mask</button>
+            </div>
+            <label class="checkbox-inline" id="sam-show-mask-row" hidden>
+              <input id="sam-show-mask-toggle" type="checkbox" checked /> Show mask
+            </label>
+          </div>
+
+          <div id="video-only-fields" hidden>
+            <div class="field" id="video-range-field">
+              <span class="field-label">
+                Trim range
+                <span id="video-range-value" class="field-value">0:00 – 0:00</span>
+              </span>
+              <div id="video-range-slider">
+                <div id="video-range-fill"></div>
+                <button id="video-range-handle-from" class="video-range-handle" type="button" title="Start point"></button>
+                <button id="video-range-handle-to" class="video-range-handle" type="button" title="End point"></button>
+                <div id="video-range-tooltip" hidden></div>
+              </div>
+              <input id="video-encode-from" type="number" min="0" step="0.1" value="0" hidden />
+              <input id="video-encode-to" type="number" min="0" step="0.1" value="0" hidden />
+            </div>
+
+            <div class="field" id="video-frame-step-field">
+              <span class="field-label">Keyframe thinning (filled with RIFE/ffmpeg)</span>
+              <div class="radio-row radio-row-compact" id="video-frame-step-radio">
+                <label><input type="radio" name="video-frame-step" value="4" checked /> 1/4 frames</label>
+                <label><input type="radio" name="video-frame-step" value="2" /> 1/2 frames</label>
+                <label><input type="radio" name="video-frame-step" value="1" /> off</label>
+              </div>
+            </div>
+
+            <div id="video-codecs-gate" class="status status-error" hidden>
+              Video codecs not installed (~150MB one-time download).
+              <button id="video-codecs-install-btn" type="button">Install codecs</button>
+            </div>
+          </div>
+
+          <label class="field" id="style-preset-field" hidden>
+            <span class="field-label">
+              SDXL preset
+              <span class="checkbox-inline"><input id="style-preset-toggle" type="checkbox" /> on</span>
+            </span>
+            <select id="style-preset">
+              <option value="">— None (classic style transfer) —</option>
+            </select>
+          </label>
+
+          <label class="field" id="style-preset-strength-field" hidden>
+            <span class="field-label">
+              Strength
+              <span id="style-preset-strength-value" class="field-value">0.50</span>
+            </span>
+            <input id="style-preset-strength" type="range" min="0.1" max="0.9" step="0.05" value="0.5" />
+          </label>
+
+          <div class="seed-row">
+            <label class="field seed-number-field">
+              <span class="field-label">Seed</span>
+              <input id="seed-value" type="number" value="42" />
+            </label>
+            <div class="checkbox-row">
+              <label class="checkbox-field"><input id="random-seed" type="checkbox" checked /> Random seed</label>
+              <label class="checkbox-field"><input id="reuse-seed" type="checkbox" /> Reuse seed</label>
+            </div>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Metadata</span>
+            <textarea id="metadata-out" rows="2" readonly></textarea>
+          </label>
+        </div>
+
+        <footer id="bottom-bar">
+          <p class="disclaimer">
+            BlobVision is unfiltered. Use at your own risk—you are solely responsible for any
+            generated or shared images.
+          </p>
+          <p class="credit">
+            Vibe-coded by GROM with Cursor and Claude. Open source, inspired by RiversHaveWings'
+            historic Colab notebook.
+          </p>
+        </footer>
+      </section>
+    </main>
+
+    <main id="studio" hidden>
+      <aside id="studio-tools">
+        <details id="studio-sticker-panel" open>
+          <summary>Stickers</summary>
+          <div id="studio-sticker-grid"></div>
+          <span class="field-label studio-sticker-group-label">Speech bubbles</span>
+          <div id="studio-sticker-shape-grid"></div>
+          <label class="field" id="studio-sticker-size-field">
+            <span class="field-label">
+              Size
+              <span id="studio-sticker-size-value" class="field-value">18%</span>
+            </span>
+            <input id="studio-sticker-size" type="range" min="5" max="60" step="1" value="18" />
+          </label>
+          <label class="field" id="studio-sticker-rotate-field">
+            <span class="field-label">
+              Rotate
+              <span id="studio-sticker-rotate-value" class="field-value">0</span>
+            </span>
+            <input id="studio-sticker-rotate" type="range" min="-180" max="180" step="1" value="0" />
+          </label>
+          <button id="studio-sticker-mirror-btn" type="button" title="Flip the sticker horizontally before stamping">Mirror</button>
+          <p class="field-hint">Pick a sticker, then click the image to stamp it (Esc to put it away). Click it again to pick up more.</p>
+        </details>
+      </aside>
+      <section id="studio-main">
+        <div id="studio-canvas">
+          <img id="studio-image" alt="" hidden crossorigin="anonymous" />
+          <div id="studio-viewport">
+            <div id="studio-image-backdrop"></div>
+            <div id="studio-patchwork-layer"></div>
+            <div id="studio-image-bg">
+              <div class="studio-rotate-handle" data-corner="tl" title="Drag to rotate"></div>
+              <div class="studio-rotate-handle" data-corner="tr" title="Drag to rotate"></div>
+              <div class="studio-rotate-handle" data-corner="bl" title="Drag to rotate"></div>
+              <div class="studio-rotate-handle" data-corner="br" title="Drag to rotate"></div>
+            </div>
+            <div id="studio-sticker-layer"></div>
+            <div id="studio-text-top" class="studio-text-overlay"></div>
+            <div id="studio-text-bottom" class="studio-text-overlay"></div>
+            <div id="studio-flash"></div>
+          </div>
+          <button id="studio-clear" class="corner-icon-btn corner-icon-btn-left" title="Remove" type="button">×</button>
+          <button id="studio-paste" class="corner-icon-btn corner-icon-btn-left-2" title="Paste" type="button">📋</button>
+          <button id="studio-copy" class="corner-icon-btn corner-icon-btn-right-2" title="Copy" type="button">⧉</button>
+          <button id="studio-download" class="corner-icon-btn corner-icon-btn-right" title="Download" type="button">⬇</button>
+        </div>
+        <div id="studio-status" class="status status-pending" hidden></div>
+        <div id="studio-strip"></div>
+      </section>
+
+      <aside id="studio-side">
+        <label class="field">
+          <span class="field-label">Insert top phrase</span>
+          <input id="studio-top-text" type="text" placeholder="TOP TEXT" />
+        </label>
+        <div class="studio-text-controls">
+          <div class="studio-scrub" id="studio-top-rotate"><span class="studio-scrub-label">rotate</span><span class="studio-scrub-value">0</span></div>
+          <div class="studio-scrub" id="studio-top-scale"><span class="studio-scrub-label">scale</span><span class="studio-scrub-value">1.00</span></div>
+          <div class="studio-scrub" id="studio-top-contour"><span class="studio-scrub-label">contour</span><span class="studio-scrub-value">0.08</span></div>
+          <div class="studio-color-swatch" id="studio-top-color-swatch">
+            <div class="studio-color-swatch-bg" title="Contour color"></div>
+            <div class="studio-color-swatch-fg" title="Text color"></div>
+            <input type="color" id="studio-top-fill-color" value="#ffffff" />
+            <input type="color" id="studio-top-stroke-color" value="#000000" />
+          </div>
+        </div>
+
+        <label class="field">
+          <span class="field-label">Insert bottom phrase</span>
+          <input id="studio-bottom-text" type="text" placeholder="BOTTOM TEXT" />
+        </label>
+        <div class="studio-text-controls">
+          <div class="studio-scrub" id="studio-bottom-rotate"><span class="studio-scrub-label">rotate</span><span class="studio-scrub-value">0</span></div>
+          <div class="studio-scrub" id="studio-bottom-scale"><span class="studio-scrub-label">scale</span><span class="studio-scrub-value">1.00</span></div>
+          <div class="studio-scrub" id="studio-bottom-contour"><span class="studio-scrub-label">contour</span><span class="studio-scrub-value">0.08</span></div>
+          <div class="studio-color-swatch" id="studio-bottom-color-swatch">
+            <div class="studio-color-swatch-bg" title="Contour color"></div>
+            <div class="studio-color-swatch-fg" title="Text color"></div>
+            <input type="color" id="studio-bottom-fill-color" value="#ffffff" />
+            <input type="color" id="studio-bottom-stroke-color" value="#000000" />
+          </div>
+        </div>
+
+        <div class="field">
+          <span class="field-label">Format</span>
+          <div class="radio-row radio-row-compact" id="studio-aspect-radio">
+            <label><input type="radio" name="studio-aspect" value="1:1" /> 1:1</label>
+            <label><input type="radio" name="studio-aspect" value="16:9" /> 16:9</label>
+            <label><input type="radio" name="studio-aspect" value="9:16" /> 9:16</label>
+            <label><input type="radio" name="studio-aspect" value="custom" checked /> custom</label>
+          </div>
+        </div>
+
+        <label class="field" id="studio-zoom-field">
+          <span class="field-label">
+            Zoom
+            <span id="studio-zoom-value" class="field-value">1.00</span>
+          </span>
+          <input id="studio-zoom" type="range" min="0.1" max="4" step="0.05" value="1" list="studio-zoom-ticks" />
+          <datalist id="studio-zoom-ticks">
+            <option value="1"></option>
+          </datalist>
+        </label>
+
+        <label class="field">
+          <span class="field-label">
+            Rotate
+            <span id="studio-rotate-value" class="field-value">0</span>
+          </span>
+          <input id="studio-rotate" type="range" min="-180" max="180" step="1" value="0" />
+        </label>
+
+        <div class="field">
+          <span class="field-label">Refine</span>
+          <div class="checkbox-row">
+            <label class="checkbox-field"><input id="studio-upscale-2x" type="checkbox" /> x2</label>
+            <label class="checkbox-field"><input id="studio-upscale-4x" type="checkbox" /> x4</label>
+            <button id="studio-upscale-apply" type="button">Apply</button>
+          </div>
+          <div class="checkbox-row">
+            <button id="studio-mirror-btn" type="button" title="Flip the background image horizontally">Mirror</button>
+            <button id="studio-undo-btn" type="button" title="Undo the last snap or sticker" disabled>Undo</button>
+            <button id="studio-snap-btn" type="button" title="Stamp the current image onto the background (Space)">Snap</button>
+          </div>
+        </div>
+
+        <button id="studio-create-btn" type="button">CREATE MEME</button>
+      </aside>
+    </main>
+
+    <div id="lightbox" hidden>
+      <img id="lightbox-image" alt="" />
+    </div>
+
+    <div id="grimoire-overlay" hidden>
+      <div id="grimoire-panel">
+        <button id="grimoire-close-btn" class="corner-icon-btn corner-icon-btn-right" title="Close" type="button">×</button>
+        <img id="grimoire-title" src="/src/grimoire-title.png" alt="Warlock's Grimoire" />
+        <div id="grimoire-tabs">
+          <button class="grimoire-tab active" data-kind="prompt" type="button">Prompt</button>
+          <button class="grimoire-tab" data-kind="negative" type="button">Negative</button>
+        </div>
+        <div id="grimoire-list"></div>
+      </div>
+    </div>
+
+    <div id="sam-overlay" hidden>
+      <div id="sam-overlay-panel">
+        <button id="sam-overlay-close-btn" class="corner-icon-btn corner-icon-btn-right" title="Close (selection is kept)" type="button">×</button>
+        <div id="sam-overlay-body">
+          <div id="sam-overlay-canvas-wrap">
+            <img id="sam-overlay-image" alt="" />
+            <canvas id="sam-overlay-mask-canvas"></canvas>
+          </div>
+          <div id="sam-overlay-side">
+            <p id="sam-status"></p>
+            <p class="field-hint">Click to select · Ctrl+click subtracts</p>
+            <div id="sam-overlay-tools">
+              <div id="sam-cut-controls">
+                <p class="field-hint">Cut punches a hole where selected; Keep punches everywhere else — stays in this view so you can keep selecting and cutting/keeping more</p>
+                <div class="checkbox-row">
+                  <label class="checkbox-inline"><input type="radio" name="sam-cut-mode" value="alpha" checked /> Alpha</label>
+                  <label class="checkbox-inline"><input type="radio" name="sam-cut-mode" value="color" /> Color</label>
+                  <input id="sam-cut-color" type="color" value="#00ff00" />
+                </div>
+                <div class="checkbox-row">
+                  <button id="sam-cut-btn" type="button" disabled>Cut</button>
+                  <button id="sam-keep-btn" type="button" disabled>Keep</button>
+                </div>
+              </div>
+              <div id="sam-overlay-controls">
+                <label class="field">
+                  <span class="field-label">
+                    Segment size
+                    <span id="sam-size-value" class="field-value">Balanced</span>
+                  </span>
+                  <input id="sam-size" type="range" min="-1" max="1" step="0.05" value="0" />
+                </label>
+                <label class="field">
+                  <span class="field-label">
+                    Soften
+                    <span id="sam-soften-value" class="field-value">4</span>
+                  </span>
+                  <input id="sam-soften" type="range" min="0" max="30" step="1" value="4" />
+                </label>
+                <label class="field">
+                  <span class="field-label">
+                    Expand / shrink
+                    <span id="sam-expand-value" class="field-value">0</span>
+                  </span>
+                  <input id="sam-expand" type="range" min="-40" max="40" step="1" value="0" />
+                </label>
+              </div>
+              <div class="checkbox-row" id="sam-overlay-btn-row">
+                <button id="sam-invert-btn" type="button">Invert</button>
+                <button id="sam-overlay-clear-btn" type="button" disabled title="Clear the current click selection only">Unselect</button>
+                <button id="sam-overlay-reset-btn" type="button" disabled title="Restore pixels removed by Cut/Keep">Reset</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
