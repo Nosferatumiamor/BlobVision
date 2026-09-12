@@ -11,9 +11,10 @@
 use std::fs;
 use std::fs::File;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::thread;
 
 // winbase.h — process creation flag telling Windows not to allocate a
 // console for this process tree even when a console-subsystem executable
@@ -29,52 +30,117 @@ const API_PORT: &str = "8420";
 struct PythonEngine(Mutex<Option<Child>>);
 
 // Portable path resolution: walks up from the RUNNING EXE'S OWN location
-// looking for the sibling venv/ + app/python/ that mark the repo root —
-// mirrors how blobvision_paths.py resolves BLOBVISION_ROOT from __file__
-// instead of cwd, so this works the same way regardless of where the
-// portable app folder was copied to. Replaces an earlier version that used
-// CARGO_MANIFEST_DIR, a compile-time constant baked in as an absolute path
-// on whichever machine built the binary — correct for `cargo tauri dev` on
-// that same machine, but wrong (and silently so — the Python child would
-// just fail to spawn) for a release binary run from anywhere else,
+// looking for the sibling app/python/blobvision_api.py that marks the repo
+// root — mirrors how blobvision_paths.py resolves BLOBVISION_ROOT from
+// __file__ instead of cwd, so this works the same way regardless of where
+// the portable app folder was copied to. Replaces an earlier version that
+// used CARGO_MANIFEST_DIR, a compile-time constant baked in as an absolute
+// path on whichever machine built the binary — correct for `cargo tauri
+// dev` on that same machine, but wrong (and silently so — the Python child
+// would just fail to spawn) for a release binary run from anywhere else,
 // including this same machine's own `target/release/` output copied
 // elsewhere, or a different machine entirely.
 //
-// Checking for both venv/Scripts/python.exe AND app/python/blobvision_api.py
-// (not just "is there a venv/ folder") avoids a false-positive match against
-// an unrelated venv/ someone happens to have sitting a few levels up.
+// Deliberately does NOT also require venv/ to exist (an earlier version
+// checked for venv/Scripts/python.exe too) — on a genuinely fresh install
+// there IS no venv yet, that's exactly what bootstrap_venv_if_missing()
+// below is for, and repo_root() has to resolve correctly *before* that can
+// even run.
 fn repo_root() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe() should always succeed");
     let mut dir = exe.parent().expect("exe path should have a parent directory").to_path_buf();
     loop {
-        let python = dir.join("venv").join("Scripts").join("python.exe");
         let api_script = dir.join("app").join("python").join("blobvision_api.py");
-        if python.is_file() && api_script.is_file() {
+        if api_script.is_file() {
             return dir;
         }
         match dir.parent() {
             Some(parent) => dir = parent.to_path_buf(),
             None => panic!(
-                "Could not find the BlobVision repo root (venv/Scripts/python.exe + \
-                 app/python/blobvision_api.py) by walking up from {}. Is this exe \
-                 still inside the portable BlobVision folder?",
+                "Could not find the BlobVision repo root (app/python/blobvision_api.py) \
+                 by walking up from {}. Is this exe still inside the portable BlobVision \
+                 folder?",
                 exe.display()
             ),
         }
     }
 }
 
+// The venv's interpreter can live in either of two layouts depending on how
+// it was created — see bootstrap_venv_if_missing()'s own doc comment for
+// the full story:
+//   - venv/Scripts/<name>.exe: a virtualenv- or `python -m venv`-created
+//     venv (this dev machine's own).
+//   - venv/<name>.exe: the flat layout bootstrap_venv.ps1 produces from
+//     Python's official embeddable package, for a machine that had no
+//     Python environment at all before BlobVision set one up.
+fn find_python_exe(root: &Path, name: &str) -> Option<PathBuf> {
+    let nested = root.join("venv").join("Scripts").join(name);
+    if nested.is_file() {
+        return Some(nested);
+    }
+    let flat = root.join("venv").join(name);
+    if flat.is_file() {
+        return Some(flat);
+    }
+    None
+}
+
+// Runs app/scripts/bootstrap_venv.ps1 when neither venv layout above is
+// present — a completely fresh machine that's never run BlobVision. A
+// no-op (returns immediately) once a venv exists, whichever layout it is,
+// so this is safe to call unconditionally on every launch rather than
+// needing its own separate "have we already done this" flag.
+fn bootstrap_venv_if_missing(root: &Path) -> std::io::Result<()> {
+    if find_python_exe(root, "python.exe").is_some() {
+        return Ok(());
+    }
+    let script = root.join("app").join("scripts").join("bootstrap_venv.ps1");
+    let log_dir = root.join("logs");
+    let _ = fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("bootstrap.log");
+    let mut cmd = Command::new("powershell");
+    cmd.arg("-NoProfile")
+        .arg("-ExecutionPolicy")
+        .arg("Bypass")
+        .arg("-File")
+        .arg(&script)
+        .arg("-TargetDir")
+        .arg(root.join("venv"))
+        .current_dir(root)
+        .creation_flags(CREATE_NO_WINDOW);
+    if let Ok(log_file) = File::create(&log_path) {
+        if let Ok(err_file) = log_file.try_clone() {
+            cmd.stdout(Stdio::from(log_file)).stderr(Stdio::from(err_file));
+        }
+    }
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("bootstrap_venv.ps1 failed (see {})", log_path.display()),
+        ));
+    }
+    Ok(())
+}
+
 fn spawn_python_engine() -> std::io::Result<Child> {
     let root = repo_root();
+    bootstrap_venv_if_missing(&root)?;
     // Release builds launch pythonw.exe, not python.exe — see the
-    // release-mode branch below for why (this venv's python.exe is a
-    // launcher stub that relaunches the real interpreter as a grandchild
-    // process, and that relaunch pops its own console window regardless of
-    // this process's own stdio/creation-flag setup). Dev builds keep
-    // python.exe, matching the plain console workflow `cargo tauri dev`
-    // already runs in.
+    // release-mode branch below for why (a virtualenv-created venv's own
+    // python.exe is a launcher stub that relaunches the real interpreter as
+    // a grandchild process, and that relaunch pops its own console window
+    // regardless of this process's own stdio/creation-flag setup). Dev
+    // builds keep python.exe, matching the plain console workflow `cargo
+    // tauri dev` already runs in.
     let python_exe_name = if cfg!(debug_assertions) { "python.exe" } else { "pythonw.exe" };
-    let python = root.join("venv").join("Scripts").join(python_exe_name);
+    let python = find_python_exe(&root, python_exe_name).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("{} not found under venv/ (checked both venv/Scripts/ and venv/) even after bootstrap", python_exe_name),
+        )
+    })?;
     let api_script = root.join("app").join("python").join("blobvision_api.py");
 
     // Mirrors app/run.ps1's env vars for the Gradio launcher: the app expects
@@ -195,12 +261,41 @@ fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![open_outputs_folder])
         .setup(|app| {
-            let child = spawn_python_engine().map_err(|err| {
-                format!(
-                    "Failed to start blobvision_api.py — is the venv set up? ({err})"
-                )
-            })?;
-            app.manage(PythonEngine(Mutex::new(Some(child))));
+            // Managed empty, filled in once spawn_python_engine() actually
+            // finishes — see the background thread below for why this
+            // can't just be a blocking call right here.
+            app.manage(PythonEngine(Mutex::new(None)));
+            let handle_for_thread = app.handle().clone();
+            thread::spawn(move || {
+                // On a machine that's never run BlobVision before,
+                // spawn_python_engine() now includes bootstrap_venv_if_missing()
+                // — a real, from-scratch Python environment setup (downloads
+                // PyTorch and ~150 other packages, several GB, easily 10+
+                // minutes). Running that inline in .setup() would block the
+                // window itself from ever appearing, which would look
+                // exactly like a hung/crashed app with zero feedback. This
+                // thread lets the window open immediately; the frontend's
+                // own "Engine unreachable, retrying..." messaging (already
+                // built for the ordinary case of the API taking a moment to
+                // start) covers this longer wait too, just for longer.
+                match spawn_python_engine() {
+                    Ok(child) => {
+                        let state = handle_for_thread.state::<PythonEngine>();
+                        *state.0.lock().unwrap() = Some(child);
+                    }
+                    Err(err) => {
+                        // Best-effort diagnostic trail — there's no
+                        // running API to report this over HTTP, and no
+                        // console in a release build to print it to.
+                        let root = repo_root();
+                        let _ = fs::create_dir_all(root.join("logs"));
+                        let _ = fs::write(
+                            root.join("logs").join("startup-error.log"),
+                            format!("Failed to start blobvision_api.py: {err}"),
+                        );
+                    }
+                }
+            });
             Ok(())
         })
         .build(tauri::generate_context!())
