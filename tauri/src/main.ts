@@ -387,6 +387,12 @@ const genStatusFillEl = $<HTMLDivElement>("#gen-status-fill");
 const genStatusTextEl = $<HTMLSpanElement>("#gen-status-text");
 const outputHintEl = $<HTMLParagraphElement>("#output-hint");
 const outputLoadingBannerEl = $<HTMLParagraphElement>("#output-loading-banner");
+const modelsInstallPanelEl = $<HTMLDivElement>("#models-install-panel");
+const modelsCbSdxlEl = $<HTMLInputElement>("#models-cb-sdxl");
+const modelsCbVqganEl = $<HTMLInputElement>("#models-cb-vqgan");
+const modelsCbStyleEl = $<HTMLInputElement>("#models-cb-style");
+const modelsInstallBtnEl = $<HTMLButtonElement>("#models-install-btn");
+const modelsInstallStatusEl = $<HTMLParagraphElement>("#models-install-status");
 const outputImageEl = $<HTMLImageElement>("#output-image");
 const outputClearBtnEl = $<HTMLButtonElement>("#output-clear");
 const useAsInitBtnEl = $<HTMLButtonElement>("#use-as-init-btn");
@@ -504,6 +510,13 @@ function familyModeBlurb(): string {
 // multi-minute wait in a session (real user feedback).
 function updateOutputHint() {
   if (!outputImageEl.hidden || !outputVideoEl.hidden) return;
+  // The install panel already explains why nothing's loading — stacking
+  // the loading banner/hint underneath it would just be noise.
+  if (!modelsInstallPanelEl.hidden) {
+    outputHintEl.hidden = true;
+    outputLoadingBannerEl.hidden = true;
+    return;
+  }
   const stillLoading = residentFamily === null;
   outputHintEl.textContent = stillLoading ? LOADING_HINT_TEXT : familyModeBlurb();
   outputHintEl.hidden = false;
@@ -593,6 +606,77 @@ async function fetchJson(path: string, init?: RequestInit): Promise<any> {
   return res.json();
 }
 
+type ModelKey = "sdxl" | "vqgan" | "style";
+const MODEL_CHECKBOXES: Record<ModelKey, HTMLInputElement> = {
+  sdxl: modelsCbSdxlEl,
+  vqgan: modelsCbVqganEl,
+  style: modelsCbStyleEl,
+};
+
+// None of SDXL Turbo / VQGAN+CLIP / Style Transfer's VGG19 ship with the
+// app or download automatically (main.rs forces HF_HUB_OFFLINE for normal
+// operation — see blobvision_engine.enable_hub_downloads) — a fresh install
+// has all three missing. Checked once right after the engine becomes
+// reachable; re-checked after an install run so the panel clears itself
+// once everything's actually in place, instead of requiring a restart.
+async function refreshModelsInstallPanel(): Promise<boolean> {
+  let status: Record<ModelKey, { ready: boolean }>;
+  try {
+    status = await fetchJson("/models/status");
+  } catch {
+    return true; // can't tell — don't block startStagedWarmup on a fluke
+  }
+  const allReady = status.sdxl.ready && status.vqgan.ready && status.style.ready;
+  modelsInstallPanelEl.hidden = allReady;
+  (Object.keys(MODEL_CHECKBOXES) as ModelKey[]).forEach((key) => {
+    const cb = MODEL_CHECKBOXES[key];
+    const ready = status[key].ready;
+    cb.checked = !ready;
+    cb.disabled = ready;
+    cb.parentElement!.classList.toggle("models-install-row-done", ready);
+  });
+  updateOutputHint();
+  return allReady;
+}
+
+modelsInstallBtnEl.addEventListener("click", async () => {
+  const targets = (Object.keys(MODEL_CHECKBOXES) as ModelKey[]).filter(
+    (key) => MODEL_CHECKBOXES[key].checked && !MODEL_CHECKBOXES[key].disabled,
+  );
+  if (targets.length === 0) return;
+  modelsInstallBtnEl.disabled = true;
+  (Object.values(MODEL_CHECKBOXES) as HTMLInputElement[]).forEach((cb) => (cb.disabled = true));
+  modelsInstallStatusEl.hidden = false;
+  modelsInstallStatusEl.textContent =
+    "Downloading " + targets.join(", ") + "… this can take several minutes.";
+  try {
+    await fetchJson("/models/install", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targets }),
+    });
+  } catch (err) {
+    modelsInstallStatusEl.textContent = "Install failed to start: " + (err as Error).message;
+    modelsInstallBtnEl.disabled = false;
+    (Object.values(MODEL_CHECKBOXES) as HTMLInputElement[]).forEach((cb) => (cb.disabled = false));
+    return;
+  }
+  const poll = async () => {
+    const allReady = await refreshModelsInstallPanel();
+    modelsInstallBtnEl.disabled = false;
+    if (allReady) {
+      modelsInstallStatusEl.hidden = true;
+      // Models that were missing when startStagedWarmup() first ran would
+      // have failed silently into an error status — now that they're here,
+      // retry rather than making the user relaunch the app.
+      startStagedWarmup();
+      return;
+    }
+    setTimeout(poll, 5000);
+  };
+  setTimeout(poll, 5000);
+});
+
 async function waitForEngine() {
   const deadline = Date.now() + HEALTH_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -604,6 +688,7 @@ async function waitForEngine() {
       // actually loaded yet (that's startStagedWarmup(), which can take
       // minutes). Enabling this early let Generate be clicked mid-warmup,
       // well before there was a resident model to generate anything with.
+      await refreshModelsInstallPanel();
       startStagedWarmup();
       return;
     } catch {

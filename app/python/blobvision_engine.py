@@ -15,9 +15,13 @@ from blobvision_paths import (
     basename_hint_from_upload,
     build_output_name,
     ensure_layout,
+    openclip_root,
     outputs_dir,
     sdxl_model_dir,
     sketch_dir,
+    vqgan_checkpoint_path,
+    vqgan_config_path,
+    vqgan_model_dir,
 )
 
 SCRIPT_DIR = APP_DIR
@@ -829,6 +833,186 @@ def enable_hub_downloads(log=None):
         pass
     if log is not None:
         log("Réseau HuggingFace activé pour le téléchargement.")
+
+
+def sdxl_weights_status():
+    # model_index.json is diffusers' own manifest, always present in a
+    # complete snapshot_download and absent from a partial/failed one —
+    # cheaper and more reliable than sizing every shard.
+    marker = os.path.join(sdxl_model_dir(), "model_index.json")
+    return {"ready": os.path.isfile(marker), "path": sdxl_model_dir()}
+
+
+def download_sdxl_weights(on_progress=None):
+    status = sdxl_weights_status()
+    if status["ready"]:
+        return status
+    enable_hub_downloads()
+    if on_progress:
+        on_progress("Downloading SDXL Turbo (~6.5 GB)...")
+    from huggingface_hub import snapshot_download
+
+    out_dir = sdxl_model_dir()
+    os.makedirs(out_dir, exist_ok=True)
+    snapshot_download(
+        "stabilityai/sdxl-turbo",
+        local_dir=out_dir,
+        ignore_patterns=["*.md", "*.pdf", "*.png", "*.jpg", "*.webp"],
+    )
+    if on_progress:
+        on_progress("SDXL Turbo installed.")
+    return sdxl_weights_status()
+
+
+def openclip_weights_status():
+    from generate import OPENCLIP_HF_REPOS
+
+    root = openclip_root()
+    for (model, tag) in OPENCLIP_HF_REPOS:
+        dest = os.path.join(root, "{}__{}".format(model, tag))
+        if not os.path.isdir(dest) or not os.listdir(dest):
+            return {"ready": False, "path": root}
+    return {"ready": True, "path": root}
+
+
+def download_openclip_weights(on_progress=None):
+    from generate import OPENCLIP_HF_REPOS
+
+    status = openclip_weights_status()
+    if status["ready"]:
+        return status
+    enable_hub_downloads()
+    from huggingface_hub import snapshot_download
+
+    root = openclip_root()
+    os.makedirs(root, exist_ok=True)
+    for (model, tag), repo_id in OPENCLIP_HF_REPOS.items():
+        dest = os.path.join(root, "{}__{}".format(model, tag))
+        if os.path.isdir(dest) and os.listdir(dest):
+            continue
+        if on_progress:
+            on_progress("Downloading CLIP weights: {}...".format(repo_id))
+        snapshot_download(repo_id=repo_id, local_dir=dest)
+    if on_progress:
+        on_progress("CLIP weights installed.")
+    return openclip_weights_status()
+
+
+# The classic vqgan_imagenet_f16_16384 checkpoint (~980 MB) has no HF Hub
+# home of its own — every VQGAN+CLIP notebook lineage (including the
+# RiversHaveWings one this app is credited to in its own UI footer) pulls it
+# from CompVis's original Heidelberg university file share. That link is
+# known to be slow/occasionally flaky under load (see
+# github.com/CompVis/taming-transformers/issues/53), which is exactly why a
+# second source is worth having: boris/vqgan_f16_16384 on the HF Hub mirrors
+# the identical config+checkpoint (verified: same byte size, same VQGAN
+# config) and, being HF Hub, downloads through the same resumable,
+# already-proven-working snapshot_download machinery as SDXL/CLIP above
+# instead of a hand-rolled HTTP GET.
+_VQGAN_HEIBOX_CONFIG_URL = (
+    "https://heibox.uni-heidelberg.de/d/a7530b09fed84f80a887/files/?p=%2Fconfigs%2Fmodel.yaml&dl=1"
+)
+_VQGAN_HEIBOX_CKPT_URL = (
+    "https://heibox.uni-heidelberg.de/d/a7530b09fed84f80a887/files/?p=%2Fckpts%2Flast.ckpt&dl=1"
+)
+_VQGAN_HF_MIRROR_REPO = "boris/vqgan_f16_16384"
+_VQGAN_CKPT_MIN_BYTES = 500 * 1024 * 1024  # real file is ~980MB; well short of that means a bad/partial download
+
+
+def vqgan_checkpoint_status():
+    cfg = vqgan_config_path()
+    ckpt = vqgan_checkpoint_path()
+    ready = (
+        os.path.isfile(cfg)
+        and os.path.isfile(ckpt)
+        and os.path.getsize(ckpt) >= _VQGAN_CKPT_MIN_BYTES
+    )
+    return {"ready": ready, "path": ckpt}
+
+
+def _stream_download(url, dest_path, on_progress=None, label=""):
+    """Plain HTTP(S) GET streamed to disk, for the non-HF-Hub heibox source."""
+    import requests
+
+    tmp_path = dest_path + ".part"
+    with requests.get(url, stream=True, timeout=30) as resp:
+        resp.raise_for_status()
+        total = int(resp.headers.get("Content-Length", 0))
+        read = 0
+        with open(tmp_path, "wb") as out:
+            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                out.write(chunk)
+                read += len(chunk)
+                if on_progress and total:
+                    on_progress("{}: {:.0f}%".format(label, 100 * read / total))
+    os.replace(tmp_path, dest_path)
+
+
+def _download_vqgan_from_heibox(cfg, ckpt, on_progress=None):
+    _stream_download(_VQGAN_HEIBOX_CONFIG_URL, cfg, on_progress, "VQGAN config (heibox)")
+    _stream_download(_VQGAN_HEIBOX_CKPT_URL, ckpt, on_progress, "VQGAN checkpoint (heibox)")
+    if os.path.getsize(ckpt) < _VQGAN_CKPT_MIN_BYTES:
+        raise IOError("Downloaded VQGAN checkpoint from heibox is too small — likely an error page, not the real file.")
+
+
+def _download_vqgan_from_hf_mirror(cfg, ckpt, on_progress=None):
+    enable_hub_downloads()
+    from huggingface_hub import hf_hub_download
+
+    out_dir = os.path.dirname(ckpt)
+    os.makedirs(out_dir, exist_ok=True)
+    if on_progress:
+        on_progress("VQGAN checkpoint (Hugging Face mirror): config...")
+    got_cfg = hf_hub_download(_VQGAN_HF_MIRROR_REPO, filename="config.yaml", local_dir=out_dir)
+    if os.path.abspath(got_cfg) != os.path.abspath(cfg):
+        os.replace(got_cfg, cfg)
+    if on_progress:
+        on_progress("VQGAN checkpoint (Hugging Face mirror): ~980 MB checkpoint...")
+    got_ckpt = hf_hub_download(_VQGAN_HF_MIRROR_REPO, filename="model.ckpt", local_dir=out_dir)
+    if os.path.abspath(got_ckpt) != os.path.abspath(ckpt):
+        os.replace(got_ckpt, ckpt)
+
+
+def download_vqgan_checkpoint(on_progress=None):
+    status = vqgan_checkpoint_status()
+    if status["ready"]:
+        return status
+    cfg = vqgan_config_path()
+    ckpt = vqgan_checkpoint_path()
+    os.makedirs(os.path.dirname(ckpt), exist_ok=True)
+    try:
+        if on_progress:
+            on_progress("Downloading VQGAN checkpoint from heibox.uni-heidelberg.de...")
+        _download_vqgan_from_heibox(cfg, ckpt, on_progress)
+    except Exception as exc:
+        print(
+            "VQGAN heibox download failed ({}: {}) — falling back to the Hugging Face mirror.".format(
+                type(exc).__name__, exc,
+            ),
+            flush=True,
+        )
+        if on_progress:
+            on_progress("Heibox source unavailable — trying Hugging Face mirror instead...")
+        _download_vqgan_from_hf_mirror(cfg, ckpt, on_progress)
+    if on_progress:
+        on_progress("VQGAN checkpoint installed.")
+    return vqgan_checkpoint_status()
+
+
+def vqgan_family_status():
+    """VQGAN+CLIP as one unit: both the generative checkpoint and the CLIP
+    weights are required together, neither is useful alone."""
+    checkpoint = vqgan_checkpoint_status()
+    clip = openclip_weights_status()
+    return {"ready": checkpoint["ready"] and clip["ready"], "checkpoint": checkpoint, "clip": clip}
+
+
+def download_vqgan_family(on_progress=None):
+    download_vqgan_checkpoint(on_progress=on_progress)
+    download_openclip_weights(on_progress=on_progress)
+    return vqgan_family_status()
 
 
 def resolve_sketch_full_gpu(cuda_device="cuda:0", explicit=None):

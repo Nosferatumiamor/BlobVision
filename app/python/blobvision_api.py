@@ -155,7 +155,7 @@ os.chdir(SCRIPT_DIR)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
@@ -174,8 +174,12 @@ from blobvision_engine import (
     BlobVisionEngine,
     BlobVRAMCache,
     _preload_hf_imports,
+    download_sdxl_weights,
+    download_vqgan_family,
     resolve_aspect_size,
     resolve_seed,
+    sdxl_weights_status,
+    vqgan_family_status,
 )
 from blobvision_deepdream import (
     DEFAULT_LAYER as DD_DEFAULT_LAYER,
@@ -201,6 +205,7 @@ from blobvision_style import (
     DEFAULT_STEPS as ST_DEFAULT_STEPS,
     DEFAULT_STYLE_STRENGTH as ST_DEFAULT_STYLE_STRENGTH,
     StyleTransferEngine,
+    download_style_transfer_weights,
     style_transfer_weights_status,
 )
 
@@ -474,6 +479,45 @@ def status():
     s = _engine.status()
     s["started"] = True
     return s
+
+
+# The big three model weight sets (SDXL Turbo, VQGAN+CLIP, Style Transfer's
+# VGG19) aren't bundled with the app or fetched automatically — main.rs
+# forces HF_HUB_OFFLINE for normal operation (see
+# blobvision_engine.enable_hub_downloads), and nothing else in the request
+# path hits the network. This is the fresh-machine install surface: check
+# what's present, and fetch whichever of the three the user asks for.
+_MODEL_DOWNLOADERS = {
+    "sdxl": download_sdxl_weights,
+    "vqgan": download_vqgan_family,
+    "style": download_style_transfer_weights,
+}
+
+
+@app.get("/models/status")
+def models_status():
+    return {
+        "sdxl": sdxl_weights_status(),
+        "vqgan": vqgan_family_status(),
+        "style": style_transfer_weights_status(),
+    }
+
+
+@app.post("/models/install")
+def models_install(targets: List[str] = Body(..., embed=True)):
+    """Kicks off one background thread per requested target that isn't
+    already installed — same fire-and-forget shape as /video/codecs/install
+    and /sam2/install; poll /models/status to see progress. Unknown target
+    names are ignored rather than erroring, so the frontend can always pass
+    its full checkbox selection without pre-filtering."""
+    started = []
+    for name in targets:
+        downloader = _MODEL_DOWNLOADERS.get(name)
+        if downloader is None:
+            continue
+        threading.Thread(target=downloader, daemon=True).start()
+        started.append(name)
+    return {"ok": True, "installing": started}
 
 
 @app.post("/warmup")

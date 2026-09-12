@@ -163,6 +163,24 @@
       <section id="preview">
         <div id="preview-main">
           <div id="output-canvas">
+            <div id="models-install-panel" hidden>
+              <p class="models-install-title">Model weights not installed</p>
+              <p class="models-install-hint">
+                BlobVision doesn't bundle these — pick which to download now
+                (each is fetched once and kept locally).
+              </p>
+              <label class="checkbox-field models-install-row">
+                <input id="models-cb-sdxl" type="checkbox" /> SDXL Turbo (~6.5 GB) — needed by every Redux sketch
+              </label>
+              <label class="checkbox-field models-install-row">
+                <input id="models-cb-vqgan" type="checkbox" /> VQGAN+CLIP (~1.5 GB) — the core blobify engine
+              </label>
+              <label class="checkbox-field models-install-row">
+                <input id="models-cb-style" type="checkbox" /> Style Transfer VGG19 (~550 MB)
+              </label>
+              <button id="models-install-btn" type="button">Download selected</button>
+              <p id="models-install-status" class="field-hint" hidden></p>
+            </div>
             <p id="output-loading-banner" hidden><span id="output-loading-dot"></span>Loading models…</p>
             <p id="output-hint">
               Selecting a family while SDXL loads (~5s after warmup) decides which model

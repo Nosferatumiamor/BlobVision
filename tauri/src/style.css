@@ -499,6 +499,55 @@ select {
   50% { opacity: 0.35; transform: scale(0.7); }
 }
 
+/* Shown instead of the loading banner when a model isn't just still
+   warming up but genuinely isn't on disk yet — a fresh install has none of
+   these bundled (see app/scripts/download_*.py), so this is the in-app
+   fix rather than a dead end pointing at a command line. */
+#models-install-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.5rem;
+  width: min(90%, 26rem);
+  padding: 1rem 1.25rem;
+  border-radius: 8px;
+  border: 1px solid var(--warn);
+  background: var(--panel);
+}
+
+.models-install-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--warn);
+}
+
+.models-install-hint {
+  margin: 0 0 0.3rem;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+.models-install-row {
+  text-align: left;
+}
+
+.models-install-row-done {
+  color: var(--ok);
+  text-decoration: line-through;
+  opacity: 0.7;
+}
+
+#models-install-btn {
+  margin-top: 0.3rem;
+}
+
+#models-install-status {
+  margin: 0;
+  text-align: center;
+}
+
 .corner-icon-btn {
   font-family: inherit;
   position: absolute;
