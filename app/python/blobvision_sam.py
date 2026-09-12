@@ -48,6 +48,13 @@ def download_sam2_weights(on_progress=None):
         return status["path"]
     from blobvision_paths import SAM2_CHECKPOINT_NAME, SAM2_HF_REPO, sam2_model_dir
 
+    # main.rs forces HF_HUB_OFFLINE=1 for the whole app (see
+    # blobvision_engine.enable_hub_downloads' own docstring) so hf_hub_download
+    # below would otherwise raise immediately on a machine where this
+    # checkpoint isn't already cached, rather than actually downloading it.
+    from blobvision_engine import enable_hub_downloads
+    enable_hub_downloads()
+
     if on_progress:
         on_progress("Downloading SAM2 checkpoint (~185 MB)...")
     from huggingface_hub import hf_hub_download
