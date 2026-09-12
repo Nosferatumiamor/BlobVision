@@ -21,19 +21,40 @@ const API_PORT: &str = "8420";
 
 struct PythonEngine(Mutex<Option<Child>>);
 
-// Dev-mode path resolution: CARGO_MANIFEST_DIR is baked in at compile time as
-// an absolute path on the machine that built it, which is fine for local
-// `cargo tauri dev` but not portable to a distributed build. The real
-// portable resolution (walk up from the exe's own location looking for
-// venv/ + app/python/, mirroring how blobvision_paths.py resolves
-// BLOBVISION_ROOT from __file__ instead of cwd) is a follow-up task once
-// this shell is far enough along to actually be packaged.
+// Portable path resolution: walks up from the RUNNING EXE'S OWN location
+// looking for the sibling venv/ + app/python/ that mark the repo root —
+// mirrors how blobvision_paths.py resolves BLOBVISION_ROOT from __file__
+// instead of cwd, so this works the same way regardless of where the
+// portable app folder was copied to. Replaces an earlier version that used
+// CARGO_MANIFEST_DIR, a compile-time constant baked in as an absolute path
+// on whichever machine built the binary — correct for `cargo tauri dev` on
+// that same machine, but wrong (and silently so — the Python child would
+// just fail to spawn) for a release binary run from anywhere else,
+// including this same machine's own `target/release/` output copied
+// elsewhere, or a different machine entirely.
+//
+// Checking for both venv/Scripts/python.exe AND app/python/blobvision_api.py
+// (not just "is there a venv/ folder") avoids a false-positive match against
+// an unrelated venv/ someone happens to have sitting a few levels up.
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent() // tauri/
-        .and_then(|p| p.parent()) // repo root
-        .expect("tauri/src-tauri should be two levels under the repo root")
-        .to_path_buf()
+    let exe = std::env::current_exe().expect("current_exe() should always succeed");
+    let mut dir = exe.parent().expect("exe path should have a parent directory").to_path_buf();
+    loop {
+        let python = dir.join("venv").join("Scripts").join("python.exe");
+        let api_script = dir.join("app").join("python").join("blobvision_api.py");
+        if python.is_file() && api_script.is_file() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => panic!(
+                "Could not find the BlobVision repo root (venv/Scripts/python.exe + \
+                 app/python/blobvision_api.py) by walking up from {}. Is this exe \
+                 still inside the portable BlobVision folder?",
+                exe.display()
+            ),
+        }
+    }
 }
 
 fn spawn_python_engine() -> std::io::Result<Child> {
