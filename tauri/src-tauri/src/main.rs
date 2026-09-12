@@ -9,9 +9,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::fs;
+use std::fs::File;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+
+// winbase.h — process creation flag telling Windows not to allocate a
+// console for this process tree even when a console-subsystem executable
+// would normally get one. See spawn_python_engine()'s release-mode branch.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use tauri::Manager;
 
@@ -59,17 +66,17 @@ fn repo_root() -> PathBuf {
 
 fn spawn_python_engine() -> std::io::Result<Child> {
     let root = repo_root();
-    let python = root.join("venv").join("Scripts").join("python.exe");
+    // Release builds launch pythonw.exe, not python.exe — see the
+    // release-mode branch below for why (this venv's python.exe is a
+    // launcher stub that relaunches the real interpreter as a grandchild
+    // process, and that relaunch pops its own console window regardless of
+    // this process's own stdio/creation-flag setup). Dev builds keep
+    // python.exe, matching the plain console workflow `cargo tauri dev`
+    // already runs in.
+    let python_exe_name = if cfg!(debug_assertions) { "python.exe" } else { "pythonw.exe" };
+    let python = root.join("venv").join("Scripts").join(python_exe_name);
     let api_script = root.join("app").join("python").join("blobvision_api.py");
 
-    // Stdio::inherit() rather than piped(): blobvision_engine.py prints
-    // progress lines with print(..., flush=True) in a lot of places, and on
-    // Windows those flush() calls can raise OSError(22) against an anonymous
-    // pipe in a way they never do against a real console/inherited handle —
-    // that exception was propagating out of engine.generate() and turning
-    // into a 500 on /generate. Inheriting this process's own stdio sidesteps
-    // the whole class of issue (and is simpler — dev mode already has a
-    // console attached, so the Python output shows up right here for free).
     // Mirrors app/run.ps1's env vars for the Gradio launcher: the app expects
     // model weights to already be present locally and must not silently hit
     // the network mid-session (see CLAUDE.md).
@@ -92,19 +99,80 @@ fn spawn_python_engine() -> std::io::Result<Child> {
     // handles correctly (falls back to CPU-offload below its own
     // total>=11GB / free>=7GB threshold). Hardcoding one mode for every
     // machine was strictly worse than letting that threshold decide.
-    let child = Command::new(python)
-        .arg(api_script)
+    let mut cmd = Command::new(python);
+    cmd.arg(api_script)
         .arg("--port")
         .arg(API_PORT)
         .arg("--no-warmup")
         .current_dir(&root)
         .env("HF_HUB_OFFLINE", "1")
-        .env("TRANSFORMERS_OFFLINE", "1")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+        .env("TRANSFORMERS_OFFLINE", "1");
 
-    Ok(child)
+    if cfg!(debug_assertions) {
+        // Dev builds (`cargo tauri dev`) already run from a real console —
+        // inherit straight into it for zero-latency live output during
+        // development.
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    } else {
+        // Release builds are windows_subsystem="windows" (no console of
+        // their own). Two things had to line up here, found by testing the
+        // real built binary end to end (a real user's report + a live
+        // process-tree dump), not by reasoning about it in the abstract:
+        //
+        // 1. venv/Scripts/python.exe in this project is NOT a plain
+        //    interpreter — it's a launcher stub (this venv was built with
+        //    virtualenv, not stdlib venv; its python.exe is 2.6x the base
+        //    install's own) that relaunches the REAL interpreter as a
+        //    GRANDCHILD process. That relaunch is the stub's own compiled
+        //    logic, entirely opaque to us — redirecting THIS process's own
+        //    stdio (Stdio::inherit() has nothing valid to inherit, hence
+        //    the console-subsystem child getting a brand-new console
+        //    window otherwise) and even CREATE_NO_WINDOW on the stub
+        //    itself changed nothing: the process-tree dump showed a
+        //    conhost.exe still spawned as a SIBLING of the grandchild
+        //    interpreter, both children of the stub, meaning the stub
+        //    decides on its own whether its child gets a console,
+        //    independent of what we do to the stub's own creation.
+        //    Switching to pythonw.exe (the GUI-subsystem sibling shipped
+        //    right next to python.exe in Scripts/) fixed it outright: its
+        //    own relaunch targets the base install's pythonw.exe too, and
+        //    a GUI-subsystem process never gets an auto-allocated console
+        //    at any point in that chain — confirmed via a live window
+        //    enumeration showing zero stray windows after the fix,
+        //    where there was reliably one before it.
+        // 2. pythonw.exe's own sys.stdout/stderr are normally None (no
+        //    console to write to) — but explicit stdio redirection still
+        //    works through both the stub and the venv's own relaunch:
+        //    confirmed the log file below actually receives every line
+        //    (SDXL placement check, warmup progress, etc.) end to end.
+        //
+        // Stdio::piped() was tried before Stdio::inherit() and rejected
+        // for a different, still-true reason: blobvision_engine.py's
+        // frequent print(..., flush=True) calls raised OSError(22) against
+        // an anonymous pipe on Windows. A real log FILE avoids that too —
+        // no "nobody's reading the other end" failure mode the way a pipe
+        // has.
+        //
+        // CREATE_NO_WINDOW is kept as a harmless belt-and-suspenders for
+        // the direct child even though it alone didn't fix the grandchild
+        // console (see point 1) — no reason to remove a flag that's doing
+        // no harm and covers this process's own console-allocation
+        // decision correctly.
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let log_dir = root.join("logs");
+        let _ = fs::create_dir_all(&log_dir);
+        let log_path = log_dir.join("blobvision-api.log");
+        if let Ok(log_file) = File::create(&log_path) {
+            if let Ok(err_file) = log_file.try_clone() {
+                cmd.stdout(Stdio::from(log_file)).stderr(Stdio::from(err_file));
+            }
+        }
+        // If the log file couldn't be created/cloned, cmd's own default
+        // (inherit) applies — same stray-console fallback as before this
+        // fix, better than failing to launch at all over a logging nicety.
+    }
+
+    cmd.spawn()
 }
 
 // Mirrors blobvision_ui.py's open_gallery(): opens the output folder in

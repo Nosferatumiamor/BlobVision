@@ -21,14 +21,21 @@ if not exist "%EXE%" (
 
 echo.
 echo  BlobVision - demarrage...
-echo  Premiere generation = chargement modeles, 1 a 3 min. Les suivantes sont rapides.
 echo.
 
-"%EXE%"
+start "" "%EXE%"
+
+REM Give it a moment, then check it's actually still running: if it is,
+REM this window has done its job and closes itself instead of sitting
+REM there for the whole session showing nothing new (the real app window
+REM is already up by now). If it crashed within that window, stay open
+REM and say so instead of vanishing silently.
+timeout /t 3 /nobreak >nul
+tasklist /fi "imagename eq blobvision.exe" 2>nul | find /i "blobvision.exe" >nul
 if errorlevel 1 (
     echo.
-    echo  BlobVision a plante ou n'a pas pu demarrer - voir l'erreur ci-dessus.
+    echo  BlobVision n'a pas demarre correctement.
+    echo  Details : logs\blobvision-api.log
+    echo.
+    pause
 )
-echo.
-echo  BlobVision ferme. Appuie sur une touche pour fermer cette fenetre.
-pause >nul
