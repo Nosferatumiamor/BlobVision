@@ -386,6 +386,7 @@ const genStatusEl = $<HTMLDivElement>("#gen-status");
 const genStatusFillEl = $<HTMLDivElement>("#gen-status-fill");
 const genStatusTextEl = $<HTMLSpanElement>("#gen-status-text");
 const outputHintEl = $<HTMLParagraphElement>("#output-hint");
+const outputLoadingBannerEl = $<HTMLParagraphElement>("#output-loading-banner");
 const outputImageEl = $<HTMLImageElement>("#output-image");
 const outputClearBtnEl = $<HTMLButtonElement>("#output-clear");
 const useAsInitBtnEl = $<HTMLButtonElement>("#use-as-init-btn");
@@ -497,11 +498,16 @@ function familyModeBlurb(): string {
 // switches to a family/mode description once a non-SDXL model has actually
 // loaded (residentFamily set) — and stays hidden entirely whenever a real
 // output image is on screen. Called after every event that could change
-// which of those three states applies.
+// which of those three states applies. The loading banner tracks the exact
+// same "still on the explanation, not the description" condition — small
+// top-right status badge alone wasn't loud enough for the one genuinely
+// multi-minute wait in a session (real user feedback).
 function updateOutputHint() {
   if (!outputImageEl.hidden || !outputVideoEl.hidden) return;
-  outputHintEl.textContent = residentFamily === null ? LOADING_HINT_TEXT : familyModeBlurb();
+  const stillLoading = residentFamily === null;
+  outputHintEl.textContent = stillLoading ? LOADING_HINT_TEXT : familyModeBlurb();
   outputHintEl.hidden = false;
+  outputLoadingBannerEl.hidden = !stillLoading;
 }
 
 // A video job's result is a <video>, every other generate call's is an
@@ -914,6 +920,7 @@ function hasInitFile(): boolean {
 function showOutput(outputUrl: string) {
   lastResultWasVideo = false;
   outputHintEl.hidden = true;
+  outputLoadingBannerEl.hidden = true;
   outputVideoEl.hidden = true;
   outputVideoEl.src = "";
   outputImageEl.src = API_BASE + outputUrl + "?t=" + Date.now();
@@ -923,6 +930,7 @@ function showOutput(outputUrl: string) {
 function showOutputVideo(outputUrl: string) {
   lastResultWasVideo = true;
   outputHintEl.hidden = true;
+  outputLoadingBannerEl.hidden = true;
   outputImageEl.hidden = true;
   outputImageEl.src = "";
   outputVideoEl.src = API_BASE + outputUrl + "?t=" + Date.now();
