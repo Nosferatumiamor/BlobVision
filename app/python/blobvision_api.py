@@ -148,12 +148,20 @@ _set_process_priority(_ABOVE_NORMAL_PRIORITY_CLASS)
 _set_process_memory_priority(_MEMORY_PRIORITY_NORMAL)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-from blobvision_paths import BLOBVISION_ROOT, VENV_PYTHON
-BLOBDREAM_ROOT = BLOBVISION_ROOT
-
 os.chdir(SCRIPT_DIR)
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+
+# Must come after the sys.path fix above, not before: a normal python.exe
+# auto-prepends the running script's own directory to sys.path, which
+# silently covered for this being in the wrong order — but the embeddable
+# interpreter bootstrap_venv.ps1 builds (python*._pth controls sys.path
+# explicitly, no auto-prepend) does not, so this import failed with
+# "ModuleNotFoundError: No module named 'blobvision_paths'" on every single
+# fresh install. Confirmed live: reproduced through a real bootstrapped
+# venv, not just reasoned about.
+from blobvision_paths import BLOBVISION_ROOT, VENV_PYTHON
+BLOBDREAM_ROOT = BLOBVISION_ROOT
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
