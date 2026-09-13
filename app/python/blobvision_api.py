@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class _ElapsedStdout:
@@ -501,29 +501,68 @@ _MODEL_DOWNLOADERS = {
     "style": download_style_transfer_weights,
 }
 
+# Guards against the same target being downloaded by two overlapping
+# background threads at once — previously nothing stopped a second
+# /models/install click (the UI re-enables its button on every 5s poll
+# regardless of whether the first download is still running) from spawning
+# a second thread that reopens the same VQGAN .part file in "wb" mode and
+# clobbers whatever the first thread had already written, so a slow/flaky
+# source (heibox, see download_vqgan_checkpoint) could be made to never
+# finish no matter how long it ran. Also captures on_progress messages and
+# any exception the downloader raises — before this, a downloader thread
+# that failed outright (e.g. both the heibox source AND its HF mirror
+# fallback erroring) died silently, and the frontend just polled "not
+# ready" forever with no indication anything had gone wrong.
+_model_install_lock = threading.Lock()
+_model_installing: set = set()
+_model_install_progress: Dict[str, str] = {}
+
 
 @app.get("/models/status")
 def models_status():
-    return {
+    with _model_install_lock:
+        installing = set(_model_installing)
+        progress = dict(_model_install_progress)
+    statuses = {
         "sdxl": sdxl_weights_status(),
         "vqgan": vqgan_family_status(),
         "style": style_transfer_weights_status(),
     }
+    for name, status in statuses.items():
+        status["installing"] = name in installing
+        status["progress"] = progress.get(name)
+    return statuses
 
 
 @app.post("/models/install")
 def models_install(targets: List[str] = Body(..., embed=True)):
     """Kicks off one background thread per requested target that isn't
-    already installed — same fire-and-forget shape as /video/codecs/install
-    and /sam2/install; poll /models/status to see progress. Unknown target
-    names are ignored rather than erroring, so the frontend can always pass
-    its full checkbox selection without pre-filtering."""
+    already installed or already downloading — same fire-and-forget shape
+    as /video/codecs/install and /sam2/install; poll /models/status to see
+    progress. Unknown target names are ignored rather than erroring, so the
+    frontend can always pass its full checkbox selection without
+    pre-filtering."""
     started = []
     for name in targets:
         downloader = _MODEL_DOWNLOADERS.get(name)
         if downloader is None:
             continue
-        threading.Thread(target=downloader, daemon=True).start()
+        with _model_install_lock:
+            if name in _model_installing:
+                continue
+            _model_installing.add(name)
+            _model_install_progress[name] = "Starting…"
+
+        def run(name=name, downloader=downloader):
+            try:
+                downloader(on_progress=lambda msg, n=name: _model_install_progress.__setitem__(n, msg))
+            except Exception as exc:
+                _model_install_progress[name] = "Failed: {}".format(exc)
+            finally:
+                with _model_install_lock:
+                    _model_installing.discard(name)
+
+        threading.Thread(target=run, daemon=True).start()
         started.append(name)
     return {"ok": True, "installing": started}
 
