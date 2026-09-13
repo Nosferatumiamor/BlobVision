@@ -97,6 +97,13 @@ let stylePresetsLoaded = false;
 // null until the first swap actually happens.
 let residentFamily: Family | null = null;
 let residentFamilySwap: Promise<void> | null = null;
+// The in-flight (or last-completed) startStagedWarmup() call — Generate is
+// enabled as soon as the engine is reachable rather than waiting out the
+// ~1-2 minute cold SDXL load, so a click that lands before that finishes
+// queues behind this instead of racing it. Always resolves (never
+// rejects — startStagedWarmup() catches its own errors into status
+// messages), so awaiting it is safe with no extra error handling.
+let stagedWarmupPromise: Promise<void> | null = null;
 let studioMode = false;
 type StudioAspect = "1:1" | "16:9" | "9:16" | "custom";
 const STUDIO_ASPECT_RATIOS: Record<Exclude<StudioAspect, "custom">, [number, number]> = {
@@ -760,7 +767,7 @@ async function refreshModelsInstallPanel(): Promise<boolean> {
         // Missing models that were skipped when startStagedWarmup() first ran
         // would have left engine-status stuck on an error — now that at least
         // these are here, retry rather than making the user relaunch the app.
-        startStagedWarmup();
+        stagedWarmupPromise = startStagedWarmup();
       }
     }
   }
@@ -835,13 +842,16 @@ async function waitForEngine() {
       await fetchJson("/health");
       setEngineStatus("Engine reachable — warming up...", "status-ok");
       bootstrapPanelEl.hidden = true;
-      // NOT generateBtn.disabled = false here — the backend responding to
-      // /health just means the process is up, not that any model has
-      // actually loaded yet (that's startStagedWarmup(), which can take
-      // minutes). Enabling this early let Generate be clicked mid-warmup,
-      // well before there was a resident model to generate anything with.
+      // Enabled here rather than waiting out startStagedWarmup() (which can
+      // take minutes on a cold SDXL load): the user can already type a
+      // prompt and hit Generate, which now queues behind
+      // stagedWarmupPromise (see onGenerate) instead of racing a model that
+      // isn't resident yet — a real click landing mid-warmup used to be the
+      // reason this stayed disabled until warmup fully finished, so this is
+      // safe now specifically because of that queueing, not despite it.
+      generateBtn.disabled = false;
       await refreshModelsInstallPanel();
-      startStagedWarmup();
+      stagedWarmupPromise = startStagedWarmup();
       return;
     } catch {
       // API server not up yet — ordinarily just normal spawn time (well
@@ -1520,6 +1530,18 @@ async function onGenerate() {
   generateBtn.disabled = true;
   outputImageEl.hidden = true;
   outputVideoEl.hidden = true;
+
+  // Generate is enabled as soon as the engine is reachable, well before
+  // SDXL has actually finished loading (see waitForEngine) — a click
+  // landing in that window queues behind the same warmup instead of
+  // racing a model that isn't resident yet, so the prompt can be typed
+  // and submitted immediately rather than the button sitting disabled for
+  // the ~1-2 minutes a cold load takes.
+  if (stagedWarmupPromise) {
+    setGenStatus("Queued — waiting for models to finish loading...", "status-pending");
+    await stagedWarmupPromise;
+  }
+
   // The "loads models, can take a minute or two" warning is only true when
   // this family isn't the currently-resident one — that's the only case
   // where ensureFamilyResident below actually unloads/loads anything;
