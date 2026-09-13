@@ -278,6 +278,24 @@ fn read_bootstrap_log(offset: u64) -> Result<(String, u64), String> {
     Ok((String::from_utf8_lossy(&buf).into_owned(), len))
 }
 
+// Deliberately does NOT call repo_root() — if repo_root() itself is what
+// panicked (its own marker-file walk-up can panic!() if it never finds
+// app/python/blobvision_api.py), calling it again just to find where to
+// log that would panic a second time and lose the message entirely.
+// current_exe()'s own parent directory is exactly where repo_root() would
+// resolve to in the overwhelming common case anyway (the exe sitting at
+// the portable folder's root), so this doesn't need repo_root()'s walk-up
+// at all for what should be a rare, already-degraded path.
+fn write_startup_error(msg: &str) {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let log_dir = dir.join("logs");
+            let _ = fs::create_dir_all(&log_dir);
+            let _ = fs::write(log_dir.join("startup-error.log"), msg);
+        }
+    }
+}
+
 #[tauri::command]
 fn open_outputs_folder() -> Result<(), String> {
     let out_dir = repo_root().join("outputs");
@@ -302,29 +320,39 @@ fn main() {
                 // On a machine that's never run BlobVision before,
                 // spawn_python_engine() now includes bootstrap_venv_if_missing()
                 // — a real, from-scratch Python environment setup (downloads
-                // PyTorch and ~150 other packages, several GB, easily 10+
-                // minutes). Running that inline in .setup() would block the
-                // window itself from ever appearing, which would look
-                // exactly like a hung/crashed app with zero feedback. This
-                // thread lets the window open immediately; the frontend's
-                // own "Engine unreachable, retrying..." messaging (already
-                // built for the ordinary case of the API taking a moment to
-                // start) covers this longer wait too, just for longer.
-                match spawn_python_engine() {
-                    Ok(child) => {
+                // PyTorch and ~90 other packages, several GB). Running that
+                // inline in .setup() would block the window itself from ever
+                // appearing, which would look exactly like a hung/crashed
+                // app with zero feedback. This thread lets the window open
+                // immediately; the frontend's own "Engine unreachable,
+                // retrying..." messaging (already built for the ordinary
+                // case of the API taking a moment to start) covers this
+                // longer wait too, just for longer.
+                //
+                // catch_unwind matters here specifically: a panic inside a
+                // spawned thread (e.g. repo_root()'s own panic!() if it ever
+                // can't find the marker file) unwinds that thread silently —
+                // no Err returned, nothing logged, the main window just sits
+                // on "still starting" forever with zero trace of what went
+                // wrong. That exact failure mode is what made a real bug
+                // undiagnosable during testing; this turns it into a normal
+                // logged error like any other startup failure.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(spawn_python_engine));
+                match result {
+                    Ok(Ok(child)) => {
                         let state = handle_for_thread.state::<PythonEngine>();
                         *state.0.lock().unwrap() = Some(child);
                     }
-                    Err(err) => {
-                        // Best-effort diagnostic trail — there's no
-                        // running API to report this over HTTP, and no
-                        // console in a release build to print it to.
-                        let root = repo_root();
-                        let _ = fs::create_dir_all(root.join("logs"));
-                        let _ = fs::write(
-                            root.join("logs").join("startup-error.log"),
-                            format!("Failed to start blobvision_api.py: {err}"),
-                        );
+                    Ok(Err(err)) => {
+                        write_startup_error(&format!("Failed to start blobvision_api.py: {err}"));
+                    }
+                    Err(panic_payload) => {
+                        let msg = panic_payload
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "startup thread panicked with a non-string payload".to_string());
+                        write_startup_error(&format!("Startup thread panicked: {msg}"));
                     }
                 }
             });

@@ -15,8 +15,8 @@ const HEALTH_POLL_MS = 1000;
 // its own much longer budget; see ENGINE_STARTUP_TIMEOUT_MS below.
 const HEALTH_TIMEOUT_MS = 60000;
 // A fresh install (see main.rs's bootstrap_venv_if_missing / app/scripts/
-// bootstrap_venv.ps1) downloads a whole Python environment + PyTorch + ~150
-// packages before the API is reachable at all — comfortably 10-30 minutes,
+// bootstrap_venv.ps1) downloads a whole Python environment + PyTorch + ~90
+// packages before the API is reachable at all — easily several minutes,
 // vs. a normal launch's well-under-a-minute startup. Has to be generous
 // enough that a legitimate bootstrap still quietly finishing doesn't get
 // mistaken for a dead process and reported as permanently "unreachable".
@@ -777,7 +777,7 @@ async function waitForEngine() {
       if (!shownSlowHint && (isBootstrapping || Date.now() - start > ENGINE_STARTUP_SLOW_HINT_MS)) {
         shownSlowHint = true;
         setEngineStatus(
-          "Still starting… first launch can take up to ~30 min while a Python environment downloads.",
+          "Still starting… first launch downloads a Python environment, speed depends on your connection and disk.",
           "status-pending",
         );
       }
