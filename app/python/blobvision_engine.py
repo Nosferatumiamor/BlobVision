@@ -1965,15 +1965,54 @@ class BlobVisionEngine:
         steps = max(1, min(int(steps), 4))
         neg = (negative_prompt or "").strip() or None
         guidance = SDXL_CFG_WITH_NEGATIVE if neg else 0.0
-        result = pipe(
-            prompt=prompt,
-            negative_prompt=neg,
-            height=int(height),
-            width=int(width),
-            num_inference_steps=steps,
-            guidance_scale=guidance,
-            generator=generator,
-        )
+
+        # Fixed filename (not out_path, which isn't known client-side until
+        # the request finishes) so the frontend can poll it by a known URL
+        # while the sketch is still generating — decodes the current latent
+        # at each of the (up to 4) steps and drops a preview there. Wrapped
+        # in try/except: this is a purely cosmetic best-effort preview, and
+        # must never be the reason a real generation fails (e.g. if a
+        # future diffusers version changes the callback_kwargs shape or the
+        # VAE decode hits a numerical edge case in fp16).
+        live_preview_path = os.path.join(outputs_dir(), "_live_preview_sketch.png")
+
+        def _on_step_end(pipe_obj, step, timestep, callback_kwargs):
+            try:
+                latents = callback_kwargs["latents"]
+                with torch.no_grad():
+                    decoded = pipe_obj.vae.decode(
+                        latents / pipe_obj.vae.config.scaling_factor, return_dict=False,
+                    )[0]
+                preview = pipe_obj.image_processor.postprocess(decoded, output_type="pil")[0]
+                preview.save(live_preview_path)
+            except Exception:
+                pass
+            return callback_kwargs
+
+        try:
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=neg,
+                height=int(height),
+                width=int(width),
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                generator=generator,
+                callback_on_step_end=_on_step_end,
+            )
+        except TypeError:
+            # Same defensive fallback _warmup_sketch_pipe already uses: an
+            # older/different pipeline class that doesn't accept
+            # callback_on_step_end at all.
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=neg,
+                height=int(height),
+                width=int(width),
+                num_inference_steps=steps,
+                guidance_scale=guidance,
+                generator=generator,
+            )
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
         result.images[0].save(out_path)
         del result
@@ -2010,7 +2049,14 @@ class BlobVisionEngine:
         profile = VQGAN_PROFILES[profile_name]
         iters = clamp_iterations(iterations)
         eng.args.max_iterations = iters
-        eng.args.display_freq = max(50, iters) if iters >= 50 else iters
+        # ~8 checkins across the run regardless of length, instead of the
+        # old max(50, iters)-or-iters spacing (which meant exactly 2
+        # checkins — i=0 and i=iters — for redux's default 25 iterations):
+        # each checkin already decodes the current state and saves it (see
+        # checkin() in generate.py), which the live-preview polling now
+        # relies on to show the image actually forming instead of a static
+        # "generating..." wait.
+        eng.args.display_freq = max(1, iters // 8)
         eng.args.cutn = profile["cutn"]
         eng.args.clip_model = profile["clip_model"]
         eng.args.clip_backend = profile.get("clip_backend", "openai")
@@ -2059,6 +2105,10 @@ class BlobVisionEngine:
             sketch_path=sketch_path,
         )
         eng.args.output = os.path.abspath(output_path)
+        # Fixed filename (not the real, timestamped output path above) so
+        # the frontend can poll it by a known URL while generation is still
+        # running, well before the real filename is known client-side.
+        eng.args.live_preview_path = os.path.join(outputs_dir(), "_live_preview_vqgan.png")
         eng.args.png_metadata = metadata_for_png(meta)
         prompt_list = build_vqgan_prompts(prompt, negative_prompt)
         print(

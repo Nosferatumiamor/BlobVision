@@ -865,7 +865,15 @@ def checkin(i, losses):
     info.add_text('comment', comment)
     if png_meta.get('blobdream'):
         info.add_text('blobdream', png_meta['blobdream'])
-    TF.to_pil_image(out[0].cpu()).save(args.output, pnginfo=info) 	
+    TF.to_pil_image(out[0].cpu()).save(args.output, pnginfo=info)
+    # Optional: also drop a copy at a fixed, well-known path the frontend can
+    # poll during generation (the real filename above isn't known client-side
+    # until the request finishes) — see blobvision_api.py's /generate and
+    # tauri/src/main.ts's pollLivePreview. None outside of the Tauri API
+    # request path (the standalone CLI usage this module also supports).
+    live_preview_path = getattr(args, 'live_preview_path', None)
+    if live_preview_path:
+        TF.to_pil_image(out[0].cpu()).save(live_preview_path)
 
 
 def ascend_txt():
