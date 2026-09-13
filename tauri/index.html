@@ -181,12 +181,15 @@
               </p>
               <label class="checkbox-field models-install-row">
                 <input id="models-cb-sdxl" type="checkbox" /> SDXL Turbo (~6.5 GB) — needed by every Redux sketch
+                <span id="models-progress-sdxl" class="models-install-row-progress"></span>
               </label>
               <label class="checkbox-field models-install-row">
                 <input id="models-cb-vqgan" type="checkbox" /> VQGAN+CLIP (~1.5 GB) — the core blobify engine
+                <span id="models-progress-vqgan" class="models-install-row-progress"></span>
               </label>
               <label class="checkbox-field models-install-row">
                 <input id="models-cb-style" type="checkbox" /> Style Transfer VGG19 (~550 MB)
+                <span id="models-progress-style" class="models-install-row-progress"></span>
               </label>
               <p class="models-install-hint">
                 DeepDream isn't listed here — it uses torchvision's own GoogLeNet

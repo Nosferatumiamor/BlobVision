@@ -596,10 +596,27 @@ select {
   text-align: left;
 }
 
+.models-install-row-progress {
+  display: block;
+  margin-left: 1.5rem;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
 .models-install-row-done {
   color: var(--ok);
-  text-decoration: line-through;
-  opacity: 0.7;
+}
+
+.models-install-row-done .models-install-row-progress {
+  color: var(--ok);
+}
+
+.models-install-row input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.models-install-row-done input[type="checkbox"] {
+  accent-color: var(--ok);
 }
 
 #models-install-btn {
