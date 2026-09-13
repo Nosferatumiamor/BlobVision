@@ -48,7 +48,10 @@ struct PythonEngine(Mutex<Option<Child>>);
 // even run.
 fn repo_root() -> PathBuf {
     let exe = std::env::current_exe().expect("current_exe() should always succeed");
-    let mut dir = exe.parent().expect("exe path should have a parent directory").to_path_buf();
+    let mut dir = exe
+        .parent()
+        .expect("exe path should have a parent directory")
+        .to_path_buf();
     loop {
         let api_script = dir.join("app").join("python").join("blobvision_api.py");
         if api_script.is_file() {
@@ -111,7 +114,8 @@ fn bootstrap_venv_if_missing(root: &Path) -> std::io::Result<()> {
         .creation_flags(CREATE_NO_WINDOW);
     if let Ok(log_file) = File::create(&log_path) {
         if let Ok(err_file) = log_file.try_clone() {
-            cmd.stdout(Stdio::from(log_file)).stderr(Stdio::from(err_file));
+            cmd.stdout(Stdio::from(log_file))
+                .stderr(Stdio::from(err_file));
         }
     }
     let status = cmd.status()?;
@@ -134,7 +138,11 @@ fn spawn_python_engine() -> std::io::Result<Child> {
     // regardless of this process's own stdio/creation-flag setup). Dev
     // builds keep python.exe, matching the plain console workflow `cargo
     // tauri dev` already runs in.
-    let python_exe_name = if cfg!(debug_assertions) { "python.exe" } else { "pythonw.exe" };
+    let python_exe_name = if cfg!(debug_assertions) {
+        "python.exe"
+    } else {
+        "pythonw.exe"
+    };
     let python = find_python_exe(&root, python_exe_name).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -230,7 +238,8 @@ fn spawn_python_engine() -> std::io::Result<Child> {
         let log_path = log_dir.join("blobvision-api.log");
         if let Ok(log_file) = File::create(&log_path) {
             if let Ok(err_file) = log_file.try_clone() {
-                cmd.stdout(Stdio::from(log_file)).stderr(Stdio::from(err_file));
+                cmd.stdout(Stdio::from(log_file))
+                    .stderr(Stdio::from(err_file));
             }
         }
         // If the log file couldn't be created/cloned, cmd's own default
@@ -269,7 +278,8 @@ fn read_bootstrap_log(offset: u64) -> Result<(String, u64), String> {
     // between polls — an offset past the new file's end means "start over"
     // rather than seeking past EOF.
     let start = if offset > len { 0 } else { offset };
-    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
     // from_utf8_lossy rather than read_to_string: this can race the
@@ -309,7 +319,12 @@ fn open_outputs_folder() -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![open_outputs_folder, read_bootstrap_log])
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            open_outputs_folder,
+            read_bootstrap_log
+        ])
         .setup(|app| {
             // Managed empty, filled in once spawn_python_engine() actually
             // finishes — see the background thread below for why this
@@ -337,7 +352,8 @@ fn main() {
                 // wrong. That exact failure mode is what made a real bug
                 // undiagnosable during testing; this turns it into a normal
                 // logged error like any other startup failure.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(spawn_python_engine));
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(spawn_python_engine));
                 match result {
                     Ok(Ok(child)) => {
                         let state = handle_for_thread.state::<PythonEngine>();
@@ -351,7 +367,9 @@ fn main() {
                             .downcast_ref::<&str>()
                             .map(|s| s.to_string())
                             .or_else(|| panic_payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "startup thread panicked with a non-string payload".to_string());
+                            .unwrap_or_else(|| {
+                                "startup thread panicked with a non-string payload".to_string()
+                            });
                         write_startup_error(&format!("Startup thread panicked: {msg}"));
                     }
                 }

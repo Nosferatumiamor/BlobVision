@@ -1250,8 +1250,18 @@ function clearOutput() {
 // generate reuses this exact sketch instead of making a new one. Not
 // forcing aspect to custom here (unlike showInitImagePreview): a sketch is
 // already rendered at the currently selected aspect's exact dimensions.
+//
+// initFileKind is still set to "image" here even though no file is
+// attached — hasInitImage()/hasInitFile() key off it for the download and
+// remove buttons (and the zoom-click fallback above), which should work
+// on a viewable sketch regardless of whether it's reuse-eligible; only the
+// actual generation-input checks (generateStyle() etc.) look at
+// initImageEl.files directly and are unaffected by this. Confirmed real
+// bug: without this, downloading or removing a shown sketch failed with
+// "img2img is empty" despite the image being clearly visible.
 async function showSketchPreview(sketchUrl: string) {
   const src = API_BASE + sketchUrl + "?t=" + Date.now();
+  initFileKind = "image";
   initImagePreviewEl.src = src;
   initImagePreviewEl.hidden = false;
   initImageHintEl.hidden = true;
@@ -2622,23 +2632,38 @@ async function fetchAsBlob(url: string): Promise<Blob> {
   return res.blob();
 }
 
-// Fetch-then-blob-URL rather than a plain <a href download>: the image URLs
-// here are cross-origin (http://127.0.0.1:8420, a different origin from the
-// app itself), and browsers/webviews silently ignore the `download`
-// attribute on cross-origin URLs for security reasons — clicking such a
-// link just navigates the whole window to the raw image instead of saving
-// it (this actually happened: it replaced the entire app UI with the image
-// on a black background, no way back except force-closing the app). A blob:
-// URL created from a fetched Blob is always same-origin to the page that
-// created it, so `download` works correctly on it regardless of where the
-// bytes originally came from.
+// Goes through the dialog/fs plugins (native Save As + a real file write)
+// rather than the old fetch-then-blob-URL + <a download> click trick.
+// That trick was already once reworked around a real WebView bug (a plain
+// <a href download> on a cross-origin URL just navigated the whole window
+// to the raw image — see the comment this replaced), but even the blob:
+// URL version confirmed to still fail: inside the packaged WebView2 shell
+// (not a plain browser tab, which is all the dev-server preview can test),
+// the click ran with no error and nothing was ever saved to disk — a
+// synthetic <a download> click on a blob: URL isn't reliably honored by
+// WebView2 the way it is in a real Chrome tab. The dialog/fs plugins talk
+// to the OS's real save-file API instead of relying on that browser-DOM
+// trick at all.
 async function downloadImage(url: string) {
   try {
     const blob = await fetchAsBlob(url);
+    const suggestedName = filenameFromUrl(url);
+    try {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const { writeFile } = await import("@tauri-apps/plugin-fs");
+      const path = await save({ defaultPath: suggestedName });
+      if (!path) return; // user cancelled the save dialog
+      await writeFile(path, new Uint8Array(await blob.arrayBuffer()));
+      return;
+    } catch (pluginErr) {
+      // Not running under Tauri (e.g. a plain browser tab against the Vite
+      // dev server) — fall back to the browser's own download mechanism.
+      console.error("Tauri save dialog unavailable, falling back:", pluginErr);
+    }
     const blobUrl = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = blobUrl;
-    a.download = filenameFromUrl(url);
+    a.download = suggestedName;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -2685,14 +2710,38 @@ async function useOutputAsInit() {
   }
 }
 
+const LIGHTBOX_MIN_ZOOM = 1;
+const LIGHTBOX_MAX_ZOOM = 3;
+let lightboxZoom = 1;
+
+function setLightboxZoom(zoom: number) {
+  lightboxZoom = Math.min(LIGHTBOX_MAX_ZOOM, Math.max(LIGHTBOX_MIN_ZOOM, zoom));
+  lightboxImageEl.style.transform = "scale(" + lightboxZoom + ")";
+  lightboxImageEl.style.cursor = lightboxZoom > LIGHTBOX_MIN_ZOOM ? "zoom-out" : "zoom-in";
+}
+
 function openLightbox(src: string) {
   lightboxImageEl.src = src;
   lightboxEl.hidden = false;
+  setLightboxZoom(1);
 }
 
 function closeLightbox() {
   lightboxEl.hidden = true;
 }
+
+// Scroll to zoom in/out on the lightbox image (up to LIGHTBOX_MAX_ZOOM,
+// centered via CSS transform rather than free-roaming pan — enough to make
+// out detail without a full pan/drag interaction the user didn't ask for).
+// preventDefault stops the whole page from scrolling behind the overlay.
+lightboxEl.addEventListener(
+  "wheel",
+  (e) => {
+    e.preventDefault();
+    setLightboxZoom(lightboxZoom - e.deltaY * 0.0015);
+  },
+  { passive: false },
+);
 
 // --- warlock's grimoire ---
 // A built-in catalogue of cryptic SD1.x-era prompt fragments (grimoire-data.ts),
@@ -4108,10 +4157,21 @@ styleImageCopyBtnEl.addEventListener("click", (e) => {
 initImageEl.addEventListener("change", onInitImageChange);
 // Clicking the init image opens the same overlay as "Magic wand" — no
 // separate plain-zoom lightbox for this one, since the overlay is a
-// strict superset (zoomed view + all the SAM tools); openSamOverlay()
-// already no-ops unless an image is actually loaded. Video preview still
-// uses its own click-to-play handling untouched.
-initImagePreviewEl.addEventListener("click", openSamOverlay);
+// strict superset (zoomed view + all the SAM tools) — EXCEPT for a
+// sketch preview shown by showSketchPreview() without "reuse img"
+// checked: openSamOverlay() correctly refuses to run SAM on it (there's
+// no uploaded file to segment), but confirmed real gap: clicking it then
+// did nothing at all rather than at least zooming, unlike the central
+// output image's own click-to-zoom. Falls back to the plain lightbox
+// whenever there's a visible image SAM can't operate on. Video preview
+// still uses its own click-to-play handling untouched.
+initImagePreviewEl.addEventListener("click", () => {
+  if (initFileKind === "image" && initImageEl.files?.[0]) {
+    openSamOverlay();
+  } else if (initImagePreviewEl.src) {
+    openLightbox(initImagePreviewEl.src);
+  }
+});
 initImageClearBtnEl.addEventListener("click", (e) => {
   e.stopPropagation();
   if (!hasInitFile()) {
