@@ -481,6 +481,7 @@ select {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  justify-content: center;
   gap: 0.6rem;
   font-size: 1.3rem;
   font-weight: 700;
@@ -489,6 +490,7 @@ select {
 
 #output-loading-detail {
   flex-basis: 100%;
+  text-align: center;
   font-size: 0.8rem;
   font-weight: 400;
   color: var(--muted);
