@@ -609,6 +609,24 @@ def _spawn_background_warmup(engine, name, warmup_fn):
     threading.Thread(target=run, daemon=True, name=name + "-warmup").start()
 
 
+# /warmup/sdxl and /warmup/vqgan both block the whole HTTP request until
+# their real weights are loaded and placed (up to ~2 minutes for a cold
+# SDXL load) — the engine already threads an on_stage callback through
+# _load_sketch_pipe() for exactly this kind of progress reporting (see
+# blobvision_engine.py's log_line/run_with_patience), it just wasn't wired
+# up to anything the frontend could see. Written here instead so a plain
+# concurrent GET (FastAPI runs these sync handlers in a threadpool, so this
+# is served fine while /warmup/sdxl's own request is still blocked in its
+# own thread) can show the "Loading models..." banner something more
+# useful than a static message for the ~2 minutes it's otherwise silent.
+_warmup_progress: Dict[str, Optional[str]] = {"sdxl": None, "vqgan": None}
+
+
+@app.get("/warmup/status")
+def warmup_status():
+    return dict(_warmup_progress)
+
+
 @app.post("/warmup/sdxl")
 def warmup_sdxl():
     """SDXL only, without VQGAN — the shared first stage of the frontend's
@@ -632,11 +650,15 @@ def warmup_sdxl():
     global _engine
     if _engine is None:
         _engine = BlobVisionEngine(keep_models=True)
-    with _engine._lock:
-        if _engine._sketch_pipe is None:
-            _engine._load_sketch_pipe()
-            _engine._vram.note_sketch_loaded_on_gpu()
-        _engine._vram.activate(BlobVRAMCache.PHASE_SKETCH)
+    _warmup_progress["sdxl"] = "Starting…"
+    try:
+        with _engine._lock:
+            if _engine._sketch_pipe is None:
+                _engine._load_sketch_pipe(on_stage=lambda msg: _warmup_progress.__setitem__("sdxl", msg))
+                _engine._vram.note_sketch_loaded_on_gpu()
+            _engine._vram.activate(BlobVRAMCache.PHASE_SKETCH)
+    finally:
+        _warmup_progress["sdxl"] = None
     _spawn_background_warmup(_engine, "sketch", _engine.run_sketch_warmup)
     return {"ok": True, "status": _engine.status()}
 
@@ -661,12 +683,16 @@ def warmup_vqgan():
     global _engine
     if _engine is None:
         _engine = BlobVisionEngine(keep_models=True)
-    with _engine._lock:
-        from blobvision_engine import DEFAULT_ITERATIONS
+    _warmup_progress["vqgan"] = "Loading VQGAN checkpoint + CLIP..."
+    try:
+        with _engine._lock:
+            from blobvision_engine import DEFAULT_ITERATIONS
 
-        _engine._ensure_vqgan("redux", DEFAULT_ITERATIONS["redux"])
-        _engine._vram.note_vqgan_loaded_on_gpu()
-        _engine._vram._park_vqgan(None)
+            _engine._ensure_vqgan("redux", DEFAULT_ITERATIONS["redux"])
+            _engine._vram.note_vqgan_loaded_on_gpu()
+            _engine._vram._park_vqgan(None)
+    finally:
+        _warmup_progress["vqgan"] = None
     _spawn_background_warmup(_engine, "vqgan", _engine.run_vqgan_warmup)
     return {"ok": True, "status": _engine.status()}
 
