@@ -98,8 +98,22 @@ body {
   justify-self: center;
 }
 
-#engine-status {
+#top-bar-right {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 0.8rem;
   justify-self: end;
+  min-width: 0;
+  max-width: 100%;
+}
+
+#fast-boot-toggle {
+  flex-shrink: 0;
+}
+
+#engine-status {
+  flex-shrink: 1;
   min-width: 0; /* same grid-track-overflow fix as #preview-main, see .status */
 }
 

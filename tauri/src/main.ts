@@ -294,6 +294,7 @@ function $<T extends HTMLElement>(selector: string): T {
 }
 
 const engineStatusEl = $<HTMLDivElement>("#engine-status");
+const fastBootCheckboxEl = $<HTMLInputElement>("#fast-boot-checkbox");
 const familyBtns = document.querySelectorAll<HTMLButtonElement>(".family-btn");
 const generateBtn = $<HTMLButtonElement>("#generate-btn");
 const promptFieldsEl = $<HTMLDivElement>("#prompt-fields");
@@ -4780,4 +4781,29 @@ studioDownloadBtnEl.addEventListener("click", (e) => {
 denoiseEl.value = String(DEFAULT_DENOISE);
 denoiseValueEl.textContent = DEFAULT_DENOISE.toFixed(2);
 onModeChange();
+
+// "Fast boot" (see main.rs's own doc comment on the Settings struct and
+// blobvision_api.py's idle watchdog): the decision of whether to kill the
+// engine on window close is made in Rust, after this page may already be
+// gone, so settings.json (not localStorage) is the source of truth — this
+// just mirrors it into the checkbox on load and pushes changes back.
+async function initFastBootToggle() {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    fastBootCheckboxEl.checked = await invoke<boolean>("get_fast_boot");
+  } catch {
+    // Not running under Tauri (e.g. a plain browser tab against the Vite
+    // dev server) — nothing to sync with, leave it at its default.
+  }
+}
+fastBootCheckboxEl.addEventListener("change", async () => {
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("set_fast_boot", { enabled: fastBootCheckboxEl.checked });
+  } catch (err) {
+    console.error("Failed to save the fast boot setting:", err);
+  }
+});
+initFastBootToggle();
+
 waitForEngine();

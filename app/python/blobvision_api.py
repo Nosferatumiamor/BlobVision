@@ -230,6 +230,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# "Fast boot" (tauri/src-tauri/src/main.rs) can leave this process running
+# after the window closes instead of killing it, so a later launch can
+# reconnect instead of paying the full cold-load cost again — this is the
+# safety net for that: if nothing has reached this API in
+# _IDLE_TIMEOUT_SECONDS, shut down on its own. Runs unconditionally
+# regardless of whether fast_boot is even on, since during ordinary active
+# use requests keep resetting the clock and it never fires; it only matters
+# in exactly the scenario it exists for. Rust's own kill-on-exit path
+# (fast_boot off) ends the process long before this could ever run.
+_last_request_time = time.time()
+_IDLE_TIMEOUT_SECONDS = 30 * 60
+
+
+@app.middleware("http")
+async def _track_activity(request, call_next):
+    global _last_request_time
+    _last_request_time = time.time()
+    return await call_next(request)
+
+
+def _idle_shutdown_watchdog():
+    while True:
+        time.sleep(60)
+        idle_for = time.time() - _last_request_time
+        if idle_for > _IDLE_TIMEOUT_SECONDS:
+            print(
+                "Idle for {:.0f} min with no requests (window likely closed a while ago) — "
+                "shutting down.".format(idle_for / 60),
+                flush=True,
+            )
+            os._exit(0)
+
+
 _engine: Optional[BlobVisionEngine] = None
 _dd_engine: Optional[DeepDreamEngine] = None
 _st_engine: Optional[StyleTransferEngine] = None
@@ -1726,6 +1759,7 @@ def main():
     import uvicorn
 
     atexit.register(_sweep_uploads_on_exit)
+    threading.Thread(target=_idle_shutdown_watchdog, daemon=True).start()
     cli = parse_args()
     global _engine
     _engine = BlobVisionEngine(keep_models=True)
