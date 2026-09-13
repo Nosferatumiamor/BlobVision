@@ -409,6 +409,9 @@ const modelsInstallPanelEl = $<HTMLDivElement>("#models-install-panel");
 const modelsCbSdxlEl = $<HTMLInputElement>("#models-cb-sdxl");
 const modelsCbVqganEl = $<HTMLInputElement>("#models-cb-vqgan");
 const modelsCbStyleEl = $<HTMLInputElement>("#models-cb-style");
+const modelsProgressSdxlEl = $<HTMLSpanElement>("#models-progress-sdxl");
+const modelsProgressVqganEl = $<HTMLSpanElement>("#models-progress-vqgan");
+const modelsProgressStyleEl = $<HTMLSpanElement>("#models-progress-style");
 const modelsInstallBtnEl = $<HTMLButtonElement>("#models-install-btn");
 const modelsInstallStatusEl = $<HTMLParagraphElement>("#models-install-status");
 const outputImageEl = $<HTMLImageElement>("#output-image");
@@ -634,6 +637,11 @@ const MODEL_CHECKBOXES: Record<ModelKey, HTMLInputElement> = {
   vqgan: modelsCbVqganEl,
   style: modelsCbStyleEl,
 };
+const MODEL_PROGRESS_ELS: Record<ModelKey, HTMLSpanElement> = {
+  sdxl: modelsProgressSdxlEl,
+  vqgan: modelsProgressVqganEl,
+  style: modelsProgressStyleEl,
+};
 
 interface ModelStatus {
   ready: boolean;
@@ -700,11 +708,14 @@ const MODEL_MANUAL_FALLBACK: Record<ModelKey, string> = {
     "Manual fallback: VGG19 normally downloads from download.pytorch.org via torchvision — if that's blocked, fetch vgg19-dcbb9e9d.pth from there directly and place it in models/style-transfer/vgg19_imagenet.pth.",
 };
 
-function describeModelStatus(key: ModelKey, status: ModelStatus): string {
-  if (modelDone(status)) return key + ": done";
-  if (status.progress && status.progress.startsWith("Failed:")) return key + ": " + status.progress;
-  if (status.installing) return status.progress ? key + ": " + status.progress : key + ": starting…";
-  return key + ": queued";
+// One-line status for a single model's own row — kept short since it sits
+// right next to that model's checkbox label rather than stacked with every
+// other target's text in one hard-to-read block at the bottom of the panel.
+function describeModelStatus(status: ModelStatus): string {
+  if (modelDone(status)) return "done";
+  if (status.progress && status.progress.startsWith("Failed:")) return status.progress;
+  if (status.installing) return status.progress || "starting…";
+  return "";
 }
 
 async function refreshModelsInstallPanel(): Promise<boolean> {
@@ -719,28 +730,32 @@ async function refreshModelsInstallPanel(): Promise<boolean> {
   modelsInstallPanelEl.hidden = allReady;
   (Object.keys(MODEL_CHECKBOXES) as ModelKey[]).forEach((key) => {
     const cb = MODEL_CHECKBOXES[key];
+    const ready = status[key].ready;
     const done = modelDone(status[key]);
-    cb.checked = !done;
-    cb.disabled = status[key].ready || status[key].installing;
+    // Ticked (green once done) rather than emptied out on completion — an
+    // unchecked box read as "nothing happened here" rather than "finished".
+    cb.checked = done ? true : !ready;
+    cb.disabled = ready || status[key].installing;
     cb.parentElement!.classList.toggle("models-install-row-done", done);
+    MODEL_PROGRESS_ELS[key].textContent = describeModelStatus(status[key]);
   });
 
   if (pendingInstallTargets.size > 0) {
-    modelsInstallStatusEl.hidden = false;
     const failedTargets = Array.from(pendingInstallTargets).filter(
       (key) => !status[key].installing && !modelDone(status[key]),
     );
-    modelsInstallStatusEl.textContent =
-      Array.from(pendingInstallTargets)
-        .map((key) => describeModelStatus(key, status[key]))
-        .join(" · ") + (failedTargets.length > 0 ? "\n" + failedTargets.map((key) => MODEL_MANUAL_FALLBACK[key]).join("\n") : "");
+    if (failedTargets.length > 0) {
+      modelsInstallStatusEl.hidden = false;
+      modelsInstallStatusEl.textContent = failedTargets.map((key) => MODEL_MANUAL_FALLBACK[key]).join("\n");
+    } else {
+      modelsInstallStatusEl.hidden = true;
+    }
     const stillGoing = Array.from(pendingInstallTargets).some((key) => status[key].installing);
     if (!stillGoing) {
       modelsInstallBtnEl.disabled = false;
       const anyFailed = failedTargets.length > 0;
       pendingInstallTargets = new Set();
       if (!anyFailed) {
-        modelsInstallStatusEl.hidden = true;
         // Missing models that were skipped when startStagedWarmup() first ran
         // would have left engine-status stuck on an error — now that at least
         // these are here, retry rather than making the user relaunch the app.
@@ -760,9 +775,8 @@ modelsInstallBtnEl.addEventListener("click", async () => {
   if (targets.length === 0) return;
   modelsInstallBtnEl.disabled = true;
   (Object.values(MODEL_CHECKBOXES) as HTMLInputElement[]).forEach((cb) => (cb.disabled = true));
-  modelsInstallStatusEl.hidden = false;
-  modelsInstallStatusEl.textContent =
-    "Downloading " + targets.join(", ") + "… this can take several minutes.";
+  modelsInstallStatusEl.hidden = true;
+  targets.forEach((key) => (MODEL_PROGRESS_ELS[key].textContent = "starting…"));
   try {
     await fetchJson("/models/install", {
       method: "POST",
