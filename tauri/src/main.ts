@@ -32,10 +32,18 @@ const ENGINE_STARTUP_SLOW_HINT_MS = 60000;
 // Self-contained and placed this early so it doesn't depend on anything
 // else in this file having run yet.
 const SPLASH_SCREEN_MS = 12000;
+const SPLASH_DOTS_INTERVAL_MS = 450;
 function initSplashScreen() {
   const splash = document.getElementById("splash-screen");
+  const dots = document.getElementById("splash-dots");
   if (!splash) return;
+  let dotCount = 0;
+  const dotsTimer = window.setInterval(() => {
+    if (dots) dots.textContent = ".".repeat(dotCount);
+    dotCount = (dotCount + 1) % 4; // 0,1,2,3 dots, then back to 0
+  }, SPLASH_DOTS_INTERVAL_MS);
   setTimeout(() => {
+    clearInterval(dotsTimer);
     splash.classList.add("hide");
     setTimeout(() => splash.remove(), 700); // matches the CSS fade-out duration
   }, SPLASH_SCREEN_MS);
