@@ -1547,29 +1547,49 @@ let previewPollTimer: ReturnType<typeof setTimeout> | null = null;
 // stale response is a no-op instead of a bug.
 let previewPollActive = false;
 
-function startGenerationPreviewPolling() {
+// "image" polls the still-image pipeline's two preview files (SDXL sketch +
+// VQGAN optimization loop). "video" polls the one video jobs drop instead
+// (see blobvision_video.py's _run_video_job) — a single fixed filename
+// shared by all three families' video mode, since they all funnel through
+// that same shared pipeline. Kept as separate modes rather than always
+// polling all three: during a video job, the img2img box already shows the
+// user's own source clip, and a stale leftover sketch file (from an
+// earlier still-image run) landing there would clobber it.
+function startGenerationPreviewPolling(mode: "image" | "video" = "image") {
   previewPollActive = true;
   const tick = () => {
     if (!previewPollActive) return;
     const t = Date.now();
-    const sketchProbe = new Image();
-    sketchProbe.onload = () => {
-      if (!previewPollActive) return;
-      initImagePreviewEl.src = sketchProbe.src;
-      initImagePreviewEl.hidden = false;
-      initImageHintEl.hidden = true;
-      initImageDropEl.classList.add("has-image");
-    };
-    sketchProbe.src = API_BASE + "/outputs/_live_preview_sketch.png?t=" + t;
 
-    const vqganProbe = new Image();
-    vqganProbe.onload = () => {
-      if (!previewPollActive) return;
-      outputImageEl.src = vqganProbe.src;
-      outputImageEl.hidden = false;
-      outputVideoEl.hidden = true;
-    };
-    vqganProbe.src = API_BASE + "/outputs/_live_preview_vqgan.png?t=" + t;
+    if (mode === "video") {
+      const videoFrameProbe = new Image();
+      videoFrameProbe.onload = () => {
+        if (!previewPollActive) return;
+        outputImageEl.src = videoFrameProbe.src;
+        outputImageEl.hidden = false;
+        outputVideoEl.hidden = true;
+      };
+      videoFrameProbe.src = API_BASE + "/outputs/_live_preview_video.png?t=" + t;
+    } else {
+      const sketchProbe = new Image();
+      sketchProbe.onload = () => {
+        if (!previewPollActive) return;
+        initImagePreviewEl.src = sketchProbe.src;
+        initImagePreviewEl.hidden = false;
+        initImageHintEl.hidden = true;
+        initImageDropEl.classList.add("has-image");
+      };
+      sketchProbe.src = API_BASE + "/outputs/_live_preview_sketch.png?t=" + t;
+
+      const vqganProbe = new Image();
+      vqganProbe.onload = () => {
+        if (!previewPollActive) return;
+        outputImageEl.src = vqganProbe.src;
+        outputImageEl.hidden = false;
+        outputVideoEl.hidden = true;
+      };
+      vqganProbe.src = API_BASE + "/outputs/_live_preview_vqgan.png?t=" + t;
+    }
 
     if (previewPollActive) previewPollTimer = setTimeout(tick, 400);
   };
@@ -1642,12 +1662,14 @@ async function onGenerate() {
   );
 
   // VQGAN's still-image path (both the SDXL sketch phase and the VQGAN
-  // optimization loop) now drops a live preview frame to a fixed filename
-  // as it goes — see blobvision_engine.py's _generate_sketch and
-  // generate.py's checkin(). Video mode has its own separate job-polling
-  // flow already and isn't wired up to this.
-  const showLivePreview = currentFamily === "vqgan" && !isVideoGenerate();
-  if (showLivePreview) startGenerationPreviewPolling();
+  // optimization loop) drops a live preview frame to a fixed filename as it
+  // goes — see blobvision_engine.py's _generate_sketch and generate.py's
+  // checkin(). Video mode (any family — they share one pipeline, see
+  // blobvision_video.py's _run_video_job) drops the latest blobified
+  // keyframe to its own fixed filename the same way.
+  const showLivePreview: "image" | "video" | null =
+    isVideoGenerate() ? "video" : currentFamily === "vqgan" ? "image" : null;
+  if (showLivePreview) startGenerationPreviewPolling(showLivePreview);
 
   try {
     await ensureFamilyResident(currentFamily);
