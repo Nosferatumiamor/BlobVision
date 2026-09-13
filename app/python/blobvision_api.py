@@ -900,9 +900,20 @@ def video_codecs_install():
     activate_video_mode() used, so the request doesn't hang for however
     long the download takes. Poll /video/codecs/status to see when it's
     ready; a second install call while one's already running just no-ops
-    against the already-in-flight download rather than starting a second."""
+    against the already-in-flight download rather than starting a second.
+
+    Gated on bundled_ready, NOT the more permissive ready (which also
+    counts a system ffmpeg found on PATH) — confirmed real bug: a machine
+    with e.g. a WinGet-installed ffmpeg already on PATH made `ready` true
+    with nothing bundled at all, so this endpoint no-op'd immediately and
+    silently never downloaded anything. Every actual video job still
+    prefers the bundled copy when present (see _resolve_codec_tool), so
+    the button's whole point is fetching that known-compatible version —
+    a newer/different system ffmpeg on PATH can behave incompatibly with
+    the exact CLI flags used here (confirmed: a WinGet ffmpeg 8.0 failed
+    the final audio mux step that the bundled version handles fine)."""
     status = video_codecs_status()
-    if status["ready"]:
+    if status["bundled_ready"]:
         return {"ok": True, "already_ready": True, "status": status}
     threading.Thread(target=setup_bundled_video_codecs, daemon=True).start()
     return {"ok": True, "installing": True}
