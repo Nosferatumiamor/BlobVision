@@ -867,13 +867,31 @@ def download_sdxl_weights(on_progress=None):
     return sdxl_weights_status()
 
 
+# These HF repos host the SAME weights under several filenames for
+# cross-library compatibility (transformers/open_clip/plain pytorch), all at
+# full size — e.g. ViT-L-14's repo carries open_clip_pytorch_model.bin,
+# open_clip_pytorch_model.safetensors, model.safetensors AND pytorch_model.bin,
+# 4 copies of a ~1.7GB file. resolve_openclip_pretrained() (generate.py) only
+# ever reads the first one it finds from this exact list, so a
+# snapshot_download of the whole repo was pulling ~3x more than needed —
+# confirmed on a real download: ViT-L-14 alone came to 6.4GB for a model that
+# only needs 1.7GB. hf_hub_download with a single filename avoids the other
+# copies entirely.
+_OPENCLIP_WEIGHT_FILENAMES = (
+    "open_clip_pytorch_model.bin",
+    "open_clip_model.safetensors",
+    "model.safetensors",
+    "pytorch_model.bin",
+)
+
+
 def openclip_weights_status():
     from generate import OPENCLIP_HF_REPOS
 
     root = openclip_root()
     for (model, tag) in OPENCLIP_HF_REPOS:
         dest = os.path.join(root, "{}__{}".format(model, tag))
-        if not os.path.isdir(dest) or not os.listdir(dest):
+        if not any(os.path.isfile(os.path.join(dest, fname)) for fname in _OPENCLIP_WEIGHT_FILENAMES):
             return {"ready": False, "path": root}
     return {"ready": True, "path": root}
 
@@ -885,16 +903,31 @@ def download_openclip_weights(on_progress=None):
     if status["ready"]:
         return status
     enable_hub_downloads()
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.utils import EntryNotFoundError
 
     root = openclip_root()
     os.makedirs(root, exist_ok=True)
     for (model, tag), repo_id in OPENCLIP_HF_REPOS.items():
         dest = os.path.join(root, "{}__{}".format(model, tag))
-        if os.path.isdir(dest) and os.listdir(dest):
+        if any(os.path.isfile(os.path.join(dest, fname)) for fname in _OPENCLIP_WEIGHT_FILENAMES):
             continue
-        with _progress_heartbeat(on_progress, "Downloading CLIP weights: {}".format(repo_id)):
-            snapshot_download(repo_id=repo_id, local_dir=dest)
+        os.makedirs(dest, exist_ok=True)
+        for fname in _OPENCLIP_WEIGHT_FILENAMES:
+            with _progress_heartbeat(on_progress, "Downloading CLIP weights: {} ({})".format(repo_id, fname)):
+                try:
+                    got = hf_hub_download(repo_id, filename=fname, local_dir=dest)
+                except EntryNotFoundError:
+                    continue
+            if os.path.abspath(got) != os.path.abspath(os.path.join(dest, fname)):
+                os.replace(got, os.path.join(dest, fname))
+            break
+        else:
+            raise IOError(
+                "None of the expected weight files ({}) were found in {}.".format(
+                    ", ".join(_OPENCLIP_WEIGHT_FILENAMES), repo_id,
+                )
+            )
     if on_progress:
         on_progress("CLIP weights installed.")
     return openclip_weights_status()

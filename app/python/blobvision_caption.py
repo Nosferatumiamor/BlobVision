@@ -94,7 +94,10 @@ def download_caption_weights(on_progress=None):
         CAPTION_MODEL_ID,
         local_dir=path,
         local_dir_use_symlinks=False,
-        ignore_patterns=["*.md", "*.pdf"],
+        # The repo carries the same weights as both model.safetensors and
+        # pytorch_model.bin (transformers prefers safetensors when both are
+        # present) — skipping the .bin halves this download for no loss.
+        ignore_patterns=["*.md", "*.pdf", "pytorch_model.bin"],
     )
     if on_progress:
         on_progress("Florence-2 caption model installed.")
