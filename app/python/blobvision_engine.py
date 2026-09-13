@@ -857,11 +857,26 @@ def download_sdxl_weights(on_progress=None):
 
     out_dir = sdxl_model_dir()
     os.makedirs(out_dir, exist_ok=True)
+    # stabilityai/sdxl-turbo hosts the SAME weights four times over: the
+    # diffusers pipeline split into per-component fp16 AND fp32 safetensors,
+    # a monolithic single-file checkpoint (sd_xl_turbo_1.0_fp16.safetensors,
+    # the A1111/ComfyUI-style format), and a full parallel ONNX Runtime
+    # export tree — none of which _load_sketch_pipe() above uses, since it
+    # loads via AutoPipelineForText2Image.from_pretrained(..., variant="fp16",
+    # use_safetensors=True). Confirmed on a real fresh download: unfiltered,
+    # this repo pulls ~20GB instead of the ~6.5GB actually needed — almost
+    # certainly the dominant cause of a disk filling up during install.
     with _progress_heartbeat(on_progress, "Downloading SDXL Turbo (~6.5 GB)"):
         snapshot_download(
             "stabilityai/sdxl-turbo",
             local_dir=out_dir,
-            ignore_patterns=["*.md", "*.pdf", "*.png", "*.jpg", "*.webp"],
+            ignore_patterns=[
+                "*.md", "*.pdf", "*.png", "*.jpg", "*.webp",
+                "*.onnx", "*.onnx_data",
+                "sd_xl_turbo_1.0*.safetensors",
+                "*/model.safetensors",
+                "*/diffusion_pytorch_model.safetensors",
+            ],
         )
     if on_progress:
         on_progress("SDXL Turbo installed.")
