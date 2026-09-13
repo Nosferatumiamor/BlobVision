@@ -25,6 +25,30 @@ const ENGINE_STARTUP_TIMEOUT_MS = 40 * 60 * 1000;
 // worth saying so instead of leaving "Checking engine..." looking stuck.
 const ENGINE_STARTUP_SLOW_HINT_MS = 60000;
 
+// Splash screen: purely cosmetic, on a fixed timer independent of actual
+// engine load progress (the Krita/Photoshop trick — cover the first stretch
+// of a wait you can't eliminate with something nicer to look at than a bare
+// "Loading models..." badge, not a promise that loading is done by then).
+// Self-contained and placed this early so it doesn't depend on anything
+// else in this file having run yet.
+const SPLASH_SCREEN_MS = 12000;
+function initSplashScreen() {
+  const splash = document.getElementById("splash-screen");
+  if (!splash) return;
+  setTimeout(() => {
+    splash.classList.add("hide");
+    setTimeout(() => splash.remove(), 700); // matches the CSS fade-out duration
+  }, SPLASH_SCREEN_MS);
+}
+// This is a type="module" script, which browsers defer until after HTML
+// parsing — DOMContentLoaded may already have fired by the time we get here,
+// in which case the listener below would never run.
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", initSplashScreen);
+} else {
+  initSplashScreen();
+}
+
 type Family = "vqgan" | "deepdream" | "style";
 
 // Mirrors blobvision_ui.py's MODE_BLURBS / ITER_SLIDER_MAX / DEFAULT_ITERATIONS /
