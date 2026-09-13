@@ -1760,6 +1760,16 @@ def main():
 
     atexit.register(_sweep_uploads_on_exit)
     threading.Thread(target=_idle_shutdown_watchdog, daemon=True).start()
+    # Magic wand isn't essential enough to ask the user about during the
+    # model-selection step (see index.html's models-install-panel), but it
+    # still needs its ~185MB checkpoint eventually — fetch it unattended in
+    # the background on every launch. download_sam2_weights() already no-ops
+    # once it's cached, so this is a cheap check on every normal launch and
+    # a small download only the first time. Pure network I/O (releases the
+    # GIL), unlike the GPU/CPU-bound SDXL+VQGAN loads — no contention risk
+    # running alongside those or any first-run model download the user
+    # kicked off themselves.
+    threading.Thread(target=download_sam2_weights, daemon=True).start()
     cli = parse_args()
     global _engine
     _engine = BlobVisionEngine(keep_models=True)
