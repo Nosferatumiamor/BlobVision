@@ -198,7 +198,10 @@
               <button id="models-install-btn" type="button">Download selected</button>
               <p id="models-install-status" class="field-hint" hidden></p>
             </div>
-            <p id="output-loading-banner" hidden><span id="output-loading-dot"></span>Loading models…</p>
+            <p id="output-loading-banner" hidden>
+              <span id="output-loading-dot"></span>Loading models…
+              <span id="output-loading-detail"></span>
+            </p>
             <p id="output-hint">
               Selecting a family while SDXL loads (~5s after warmup) decides which model
               loads next to it. Switching families after that loads nothing by itself —

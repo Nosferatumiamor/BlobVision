@@ -403,6 +403,7 @@ const genStatusFillEl = $<HTMLDivElement>("#gen-status-fill");
 const genStatusTextEl = $<HTMLSpanElement>("#gen-status-text");
 const outputHintEl = $<HTMLParagraphElement>("#output-hint");
 const outputLoadingBannerEl = $<HTMLParagraphElement>("#output-loading-banner");
+const outputLoadingDetailEl = $<HTMLSpanElement>("#output-loading-detail");
 const bootstrapPanelEl = $<HTMLDivElement>("#bootstrap-panel");
 const bootstrapConsoleEl = $<HTMLPreElement>("#bootstrap-console");
 const modelsInstallPanelEl = $<HTMLDivElement>("#models-install-panel");
@@ -961,55 +962,89 @@ function dropStartupPriority() {
   });
 }
 
+// /warmup/sdxl and /warmup/vqgan each block their whole HTTP request until
+// the real weights are loaded (up to ~2 minutes cold for SDXL) — this polls
+// a separate, near-instant status endpoint concurrently to show what's
+// actually happening on the "Loading models..." banner instead of leaving
+// it static the whole time (confirmed real complaint: 1-2 minutes with no
+// indication of progress). Purely cosmetic — a failed poll just leaves the
+// detail line stale until the next tick, never blocks or errors anything.
+let warmupPollTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function pollWarmupStatus() {
+  try {
+    const status = await fetchJson("/warmup/status");
+    outputLoadingDetailEl.textContent = status.sdxl || status.vqgan || "";
+  } catch {
+    // ignore — next tick retries
+  }
+  warmupPollTimer = setTimeout(pollWarmupStatus, 1000);
+}
+
+function stopWarmupPolling() {
+  if (warmupPollTimer !== null) {
+    clearTimeout(warmupPollTimer);
+    warmupPollTimer = null;
+  }
+  outputLoadingDetailEl.textContent = "";
+}
+
 async function startStagedWarmup() {
-  // Skip the call entirely rather than let it fail — with the weights
-  // missing, /warmup/sdxl returning {ok:false} promptly is strictly better
-  // than eating a round-trip (or, before the backend guard, a raw
-  // exception) just to learn what we already knew from /models/status. The
-  // models-install-panel (shown by refreshModelsInstallPanel, called right
-  // before this) is the actionable fix, so this only needs to log, not
-  // surface as an "error".
-  if (modelsStatusCache && !modelsStatusCache.sdxl.ready) {
-    setEngineStatus("SDXL Turbo not installed — see Download models below.", "status-error");
-  } else {
-    try {
-      await fetchJson("/warmup/sdxl", { method: "POST" });
-      setEngineStatus("SDXL ready — loading " + currentFamily + "...", "status-ok");
-    } catch (err) {
-      setEngineStatus("SDXL warmup failed: " + (err as Error).message, "status-error");
+  pollWarmupStatus();
+  try {
+    // Skip the call entirely rather than let it fail — with the weights
+    // missing, /warmup/sdxl returning {ok:false} promptly is strictly
+    // better than eating a round-trip (or, before the backend guard, a
+    // raw exception) just to learn what we already knew from
+    // /models/status. The models-install-panel (shown by
+    // refreshModelsInstallPanel, called right before this) is the
+    // actionable fix, so this only needs to log, not surface as an
+    // "error".
+    if (modelsStatusCache && !modelsStatusCache.sdxl.ready) {
+      setEngineStatus("SDXL Turbo not installed — see Download models below.", "status-error");
+    } else {
+      try {
+        await fetchJson("/warmup/sdxl", { method: "POST" });
+        setEngineStatus("SDXL ready — loading " + currentFamily + "...", "status-ok");
+      } catch (err) {
+        setEngineStatus("SDXL warmup failed: " + (err as Error).message, "status-error");
+        dropStartupPriority();
+        // Enabled even on failure: a broken warmup should surface as a
+        // clear "Generation failed: ..." from the actual generate call
+        // (existing error handling in onGenerate), not as a silently-stuck
+        // disabled button with no way to even attempt it or see why.
+        generateBtn.disabled = false;
+        return;
+      }
+    }
+
+    const family = currentFamily;
+    if (!familyModelsReady(family)) {
+      // Same reasoning as the SDXL skip above — ensureFamilyResident()
+      // would just fail cleanly (backend guard) or throw (network/other),
+      // neither of which teaches the user anything the install panel
+      // doesn't already say. Generate stays disabled: there's genuinely
+      // no model to use.
+      setEngineStatus(family + " weights not installed — see Download models below.", "status-error");
       dropStartupPriority();
-      // Enabled even on failure: a broken warmup should surface as a clear
-      // "Generation failed: ..." from the actual generate call (existing
-      // error handling in onGenerate), not as a silently-stuck disabled
-      // button with no way to even attempt it or see why.
-      generateBtn.disabled = false;
+      updateOutputHint();
       return;
     }
-  }
-
-  const family = currentFamily;
-  if (!familyModelsReady(family)) {
-    // Same reasoning as the SDXL skip above — ensureFamilyResident() would
-    // just fail cleanly (backend guard) or throw (network/other), neither
-    // of which teaches the user anything the install panel doesn't already
-    // say. Generate stays disabled: there's genuinely no model to use.
-    setEngineStatus(family + " weights not installed — see Download models below.", "status-error");
+    try {
+      await ensureFamilyResident(family);
+      setEngineStatus("Engine ready (SDXL + " + family + ")", "status-ok");
+    } catch (err) {
+      setEngineStatus("SDXL ready — " + family + " warmup failed: " + (err as Error).message, "status-error");
+    }
+    // Only now — after the full staged warmup (SDXL + whichever family the
+    // user landed on) actually finished, success or not — is there a real
+    // model loaded to generate with.
+    generateBtn.disabled = false;
     dropStartupPriority();
     updateOutputHint();
-    return;
+  } finally {
+    stopWarmupPolling();
   }
-  try {
-    await ensureFamilyResident(family);
-    setEngineStatus("Engine ready (SDXL + " + family + ")", "status-ok");
-  } catch (err) {
-    setEngineStatus("SDXL ready — " + family + " warmup failed: " + (err as Error).message, "status-error");
-  }
-  // Only now — after the full staged warmup (SDXL + whichever family the
-  // user landed on) actually finished, success or not — is there a real
-  // model loaded to generate with.
-  generateBtn.disabled = false;
-  dropStartupPriority();
-  updateOutputHint();
 }
 
 // Applies the current mode's iteration range/default + denoise visibility —
