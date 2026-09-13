@@ -635,6 +635,12 @@ const MODEL_CHECKBOXES: Record<ModelKey, HTMLInputElement> = {
   style: modelsCbStyleEl,
 };
 
+interface ModelStatus {
+  ready: boolean;
+  installing: boolean;
+  progress: string | null;
+}
+
 // None of SDXL Turbo / VQGAN+CLIP / Style Transfer's VGG19 ship with the
 // app or download automatically (main.rs forces HF_HUB_OFFLINE for normal
 // operation — see blobvision_engine.enable_hub_downloads) — a fresh install
@@ -642,7 +648,7 @@ const MODEL_CHECKBOXES: Record<ModelKey, HTMLInputElement> = {
 // can skip a doomed warmup call instead of eating an avoidable error — see
 // familyModelsReady(). Checked once right after the engine becomes
 // reachable, and again after any install run.
-let modelsStatusCache: Record<ModelKey, { ready: boolean }> | null = null;
+let modelsStatusCache: Record<ModelKey, ModelStatus> | null = null;
 
 // Which gated models a family's OWN warmup needs — used to decide whether
 // to even attempt it. DeepDream isn't listed: its GoogLeNet weights come
@@ -656,8 +662,26 @@ function familyModelsReady(family: Family): boolean {
   return true;
 }
 
+// Targets requested by the in-flight "Download selected" click, kept
+// disabled/unchecked until every one of them is either ready or has failed
+// (status[key].installing goes false without ready going true). Previously
+// the button re-enabled itself on every 5s poll tick regardless of whether
+// the download was still running, which invited impatient repeat clicks —
+// each one spawned another background thread racing the first to write the
+// same partial file, which is exactly how a slow VQGAN download could end
+// up truly stuck rather than just slow (see the matching backend fix in
+// blobvision_api.py's _model_installing guard).
+let pendingInstallTargets: Set<ModelKey> = new Set();
+
+function describeModelStatus(key: ModelKey, status: ModelStatus): string {
+  if (status.ready) return key + ": done";
+  if (status.progress && status.progress.startsWith("Failed:")) return key + ": " + status.progress;
+  if (status.installing) return status.progress ? key + ": " + status.progress : key + ": starting…";
+  return key + ": queued";
+}
+
 async function refreshModelsInstallPanel(): Promise<boolean> {
-  let status: Record<ModelKey, { ready: boolean }>;
+  let status: Record<ModelKey, ModelStatus>;
   try {
     status = await fetchJson("/models/status");
   } catch {
@@ -670,9 +694,32 @@ async function refreshModelsInstallPanel(): Promise<boolean> {
     const cb = MODEL_CHECKBOXES[key];
     const ready = status[key].ready;
     cb.checked = !ready;
-    cb.disabled = ready;
+    cb.disabled = ready || status[key].installing;
     cb.parentElement!.classList.toggle("models-install-row-done", ready);
   });
+
+  if (pendingInstallTargets.size > 0) {
+    modelsInstallStatusEl.hidden = false;
+    modelsInstallStatusEl.textContent = Array.from(pendingInstallTargets)
+      .map((key) => describeModelStatus(key, status[key]))
+      .join(" · ");
+    const stillGoing = Array.from(pendingInstallTargets).some((key) => status[key].installing);
+    if (!stillGoing) {
+      modelsInstallBtnEl.disabled = false;
+      const anyFailed = Array.from(pendingInstallTargets).some(
+        (key) => !status[key].ready && !status[key].installing,
+      );
+      pendingInstallTargets = new Set();
+      if (!anyFailed) {
+        modelsInstallStatusEl.hidden = true;
+        // Missing models that were skipped when startStagedWarmup() first ran
+        // would have left engine-status stuck on an error — now that at least
+        // these are here, retry rather than making the user relaunch the app.
+        startStagedWarmup();
+      }
+    }
+  }
+
   updateOutputHint();
   return allReady;
 }
@@ -699,26 +746,12 @@ modelsInstallBtnEl.addEventListener("click", async () => {
     (Object.values(MODEL_CHECKBOXES) as HTMLInputElement[]).forEach((cb) => (cb.disabled = false));
     return;
   }
-  // Tracks only the targets THIS click actually requested — refreshModelsInstallPanel()'s
-  // own "allReady" means all three, which would never come true (and poll
-  // forever) if the user deliberately left one unchecked. The panel itself
-  // stays visible either way (driven independently by refreshModelsInstallPanel)
-  // so whatever's still missing remains fixable later.
+  pendingInstallTargets = new Set(targets);
   const poll = async () => {
     await refreshModelsInstallPanel();
-    const requestedReady = targets.every((key) => modelsStatusCache![key].ready);
-    modelsInstallBtnEl.disabled = false;
-    if (requestedReady) {
-      modelsInstallStatusEl.hidden = true;
-      // Missing models that were skipped when startStagedWarmup() first ran
-      // would have left engine-status stuck on an error — now that at least
-      // these are here, retry rather than making the user relaunch the app.
-      startStagedWarmup();
-      return;
-    }
-    setTimeout(poll, 5000);
+    if (pendingInstallTargets.size > 0) setTimeout(poll, 2000);
   };
-  setTimeout(poll, 5000);
+  setTimeout(poll, 2000);
 });
 
 // Tails logs/bootstrap.log via the Rust side (read_bootstrap_log in

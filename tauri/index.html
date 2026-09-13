@@ -188,6 +188,10 @@
               <label class="checkbox-field models-install-row">
                 <input id="models-cb-style" type="checkbox" /> Style Transfer VGG19 (~550 MB)
               </label>
+              <p class="models-install-hint">
+                DeepDream isn't listed here — it uses torchvision's own GoogLeNet
+                weights, fetched automatically the first time you use it.
+              </p>
               <button id="models-install-btn" type="button">Download selected</button>
               <p id="models-install-status" class="field-hint" hidden></p>
             </div>

@@ -898,17 +898,18 @@ def download_openclip_weights(on_progress=None):
     return openclip_weights_status()
 
 
-# The classic vqgan_imagenet_f16_16384 checkpoint (~980 MB) has no HF Hub
-# home of its own — every VQGAN+CLIP notebook lineage (including the
-# RiversHaveWings one this app is credited to in its own UI footer) pulls it
-# from CompVis's original Heidelberg university file share. That link is
-# known to be slow/occasionally flaky under load (see
-# github.com/CompVis/taming-transformers/issues/53), which is exactly why a
-# second source is worth having: boris/vqgan_f16_16384 on the HF Hub mirrors
-# the identical config+checkpoint (verified: same byte size, same VQGAN
-# config) and, being HF Hub, downloads through the same resumable,
-# already-proven-working snapshot_download machinery as SDXL/CLIP above
-# instead of a hand-rolled HTTP GET.
+# The classic vqgan_imagenet_f16_16384 checkpoint (~980 MB) originates from
+# CompVis's Heidelberg university file share — every VQGAN+CLIP notebook
+# lineage (including the RiversHaveWings one this app is credited to in its
+# own UI footer) traditionally pulls it from there. That link is known to be
+# slow/occasionally flaky under load (see
+# github.com/CompVis/taming-transformers/issues/53), and its hand-rolled
+# streamed HTTP GET has none of huggingface_hub's resume/retry handling —
+# boris/vqgan_f16_16384 on the HF Hub mirrors the identical config+checkpoint
+# (verified: same byte size, same VQGAN config), so it's tried FIRST and
+# downloads through the same resumable, already-proven-working
+# hf_hub_download machinery as SDXL/CLIP above; heibox is now only the
+# fallback for if the HF mirror itself is ever pulled or unreachable.
 _VQGAN_HEIBOX_CONFIG_URL = (
     "https://heibox.uni-heidelberg.de/d/a7530b09fed84f80a887/files/?p=%2Fconfigs%2Fmodel.yaml&dl=1"
 )
@@ -984,18 +985,18 @@ def download_vqgan_checkpoint(on_progress=None):
     os.makedirs(os.path.dirname(ckpt), exist_ok=True)
     try:
         if on_progress:
-            on_progress("Downloading VQGAN checkpoint from heibox.uni-heidelberg.de...")
-        _download_vqgan_from_heibox(cfg, ckpt, on_progress)
+            on_progress("Downloading VQGAN checkpoint from the Hugging Face mirror...")
+        _download_vqgan_from_hf_mirror(cfg, ckpt, on_progress)
     except Exception as exc:
         print(
-            "VQGAN heibox download failed ({}: {}) — falling back to the Hugging Face mirror.".format(
+            "VQGAN Hugging Face mirror download failed ({}: {}) — falling back to heibox.uni-heidelberg.de.".format(
                 type(exc).__name__, exc,
             ),
             flush=True,
         )
         if on_progress:
-            on_progress("Heibox source unavailable — trying Hugging Face mirror instead...")
-        _download_vqgan_from_hf_mirror(cfg, ckpt, on_progress)
+            on_progress("Hugging Face mirror unavailable — trying heibox.uni-heidelberg.de instead...")
+        _download_vqgan_from_heibox(cfg, ckpt, on_progress)
     if on_progress:
         on_progress("VQGAN checkpoint installed.")
     return vqgan_checkpoint_status()
