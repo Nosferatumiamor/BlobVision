@@ -1496,6 +1496,61 @@ function isVideoGenerate(): boolean {
   return hasInitVideo() && isVideoFamily();
 }
 
+// Polls two fixed-filename URLs the backend overwrites as it goes (see
+// blobvision_engine.py's _generate_sketch and generate.py's checkin()) —
+// not the real output URL, which isn't known client-side until the request
+// finishes. Uses a throwaway Image() to probe each poll rather than setting
+// outputImageEl.src/initImagePreviewEl.src directly: a 404 (nothing
+// written yet, e.g. before the first checkin) would otherwise flash a
+// broken-image icon; this only swaps the real element's src once a fetch
+// actually succeeds, so a miss just leaves the previous frame on screen.
+let previewPollTimer: ReturnType<typeof setTimeout> | null = null;
+// Guards against a genuine race, confirmed live: an Image() probe already
+// in flight when the real generation finishes can have its onload fire
+// AFTER showOutput()/showSketchPreview() already set the correct final
+// image, clobbering it back to a stale (or by-then-overwritten) preview
+// frame — clearTimeout only stops FUTURE polls, not one already in
+// transit. Checked at the top of both onload handlers so a late-arriving
+// stale response is a no-op instead of a bug.
+let previewPollActive = false;
+
+function startGenerationPreviewPolling() {
+  previewPollActive = true;
+  const tick = () => {
+    if (!previewPollActive) return;
+    const t = Date.now();
+    const sketchProbe = new Image();
+    sketchProbe.onload = () => {
+      if (!previewPollActive) return;
+      initImagePreviewEl.src = sketchProbe.src;
+      initImagePreviewEl.hidden = false;
+      initImageHintEl.hidden = true;
+      initImageDropEl.classList.add("has-image");
+    };
+    sketchProbe.src = API_BASE + "/outputs/_live_preview_sketch.png?t=" + t;
+
+    const vqganProbe = new Image();
+    vqganProbe.onload = () => {
+      if (!previewPollActive) return;
+      outputImageEl.src = vqganProbe.src;
+      outputImageEl.hidden = false;
+      outputVideoEl.hidden = true;
+    };
+    vqganProbe.src = API_BASE + "/outputs/_live_preview_vqgan.png?t=" + t;
+
+    if (previewPollActive) previewPollTimer = setTimeout(tick, 400);
+  };
+  tick();
+}
+
+function stopGenerationPreviewPolling() {
+  previewPollActive = false;
+  if (previewPollTimer !== null) {
+    clearTimeout(previewPollTimer);
+    previewPollTimer = null;
+  }
+}
+
 async function onGenerate() {
   const prompt = promptEl.value.trim();
   if (isVideoGenerate()) {
@@ -1553,6 +1608,14 @@ async function onGenerate() {
     "status-pending",
   );
 
+  // VQGAN's still-image path (both the SDXL sketch phase and the VQGAN
+  // optimization loop) now drops a live preview frame to a fixed filename
+  // as it goes — see blobvision_engine.py's _generate_sketch and
+  // generate.py's checkin(). Video mode has its own separate job-polling
+  // flow already and isn't wired up to this.
+  const showLivePreview = currentFamily === "vqgan" && !isVideoGenerate();
+  if (showLivePreview) startGenerationPreviewPolling();
+
   try {
     await ensureFamilyResident(currentFamily);
     updateOutputHint();
@@ -1577,6 +1640,7 @@ async function onGenerate() {
     if (/cancell?ed|aborted/i.test(message)) setGenStatus("Cancelled.", "status-error");
     else setGenStatus("Generation failed: " + message, "status-error");
   } finally {
+    if (showLivePreview) stopGenerationPreviewPolling();
     generateBtn.disabled = false;
   }
 }
