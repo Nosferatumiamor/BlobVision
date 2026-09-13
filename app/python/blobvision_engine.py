@@ -54,16 +54,33 @@ class BlobVRAMCache:
     PHASE_SKETCH = "sketch"
     PHASE_VQGAN = "vqgan"
 
+    # Extra headroom required, on top of the other phase's own measured
+    # footprint, before skipping the park step and keeping both models
+    # resident in VRAM at once — covers activation memory a forward/backward
+    # pass spikes into, not just the static weight footprint _log_vram
+    # reports. Deliberately conservative: guessing wrong here means an OOM
+    # mid-generation, not just a slower swap.
+    _CORESIDENT_MARGIN_BYTES = int(2.5 * 1e9)
+
     def __init__(self, engine):
         self.engine = engine
         self.active = None
         self._sketch_on_gpu = False
         self._vqgan_on_gpu = False
+        # Filled in by _log_vram the first time each phase is measured
+        # resident alone (i.e. before coresidence has ever kicked in) —
+        # used afterward to decide whether there's enough free VRAM to add
+        # the OTHER phase alongside an already-resident one instead of
+        # parking it first. Reset alongside everything else on reset().
+        self._sketch_footprint_bytes = None
+        self._vqgan_footprint_bytes = None
 
     def reset(self):
         self.active = None
         self._sketch_on_gpu = False
         self._vqgan_on_gpu = False
+        self._sketch_footprint_bytes = None
+        self._vqgan_footprint_bytes = None
 
     def activate(self, phase, log=None):
         if phase not in (self.PHASE_SKETCH, self.PHASE_VQGAN):
@@ -72,15 +89,62 @@ class BlobVRAMCache:
             return
         import time
         t0 = time.time()
-        if phase == self.PHASE_SKETCH:
-            self._park_vqgan(log)
-            self._unpark_sketch(log)
-        else:
-            self._park_sketch(log)
-            self._unpark_vqgan(log)
+        if not self._coreside_if_it_fits(phase, log):
+            if phase == self.PHASE_SKETCH:
+                self._park_vqgan(log)
+                self._unpark_sketch(log)
+            else:
+                self._park_sketch(log)
+                self._unpark_vqgan(log)
         self.active = phase
         self._log_vram(phase, log)
         self._say("VRAM cache: phase switch -> {} took {:.1f}s total.".format(phase, time.time() - t0), log)
+
+    def _coreside_if_it_fits(self, phase, log):
+        """If the OTHER phase's model is already resident and there's
+        enough measured-plus-margin free VRAM to add the needed phase
+        alongside it, do that instead of parking the other first — skips
+        the several-second CPU<->GPU round trip on every single phase
+        switch within one family (measured on a real 12.9GB-VRAM session:
+        ~3-5s per switch, on top of the actual generation time). Decided
+        up front from a real VRAM reading rather than attempted-then-
+        unwound on failure: an OOM partway through moving a multi-component
+        pipeline (SDXL's 7 separate submodules) could leave it split
+        between CPU and GPU in a broken state, so this only ever proceeds
+        when it already looks safe, and simply declines (falling through
+        to the normal park/unpark path) otherwise — never a worse outcome
+        than the always-park behavior this augments."""
+        import torch
+        dev = self.engine.cuda_device
+        if not dev.startswith("cuda") or not torch.cuda.is_available():
+            return False
+        other_resident = self._vqgan_on_gpu if phase == self.PHASE_SKETCH else self._sketch_on_gpu
+        if not other_resident:
+            return False
+        needed_bytes = (
+            self._sketch_footprint_bytes if phase == self.PHASE_SKETCH else self._vqgan_footprint_bytes
+        )
+        if needed_bytes is None:
+            return False  # this phase's footprint hasn't been measured yet — play it safe
+        try:
+            free, _total = torch.cuda.mem_get_info()
+        except Exception:
+            return False
+        if free < needed_bytes + self._CORESIDENT_MARGIN_BYTES:
+            return False
+        self._say(
+            "VRAM cache: {:.1f} GB free covers the other phase too ({:.1f} GB needed) — "
+            "keeping both models resident instead of swapping.".format(
+                free / 1e9, needed_bytes / 1e9,
+            ),
+            log,
+        )
+        if phase == self.PHASE_SKETCH:
+            self._unpark_sketch(log)
+            return self._sketch_on_gpu
+        else:
+            self._unpark_vqgan(log)
+            return self._vqgan_on_gpu
 
     def note_sketch_loaded_on_gpu(self):
         if self.engine._sketch_pipe is not None and self.engine.sketch_full_gpu:
@@ -117,6 +181,18 @@ class BlobVRAMCache:
             return
         try:
             free, total = torch.cuda.mem_get_info()
+            # Only a clean single-phase reading (not already coresident) is
+            # a meaningful footprint for that phase alone — see
+            # _coreside_if_it_fits, which uses these to judge whether the
+            # OTHER phase would still fit alongside what's currently
+            # resident. Harmless to keep overwriting on every such reading;
+            # nothing depends on this being a one-time measurement.
+            if not (self._sketch_on_gpu and self._vqgan_on_gpu):
+                used = total - free
+                if phase == self.PHASE_SKETCH:
+                    self._sketch_footprint_bytes = used
+                else:
+                    self._vqgan_footprint_bytes = used
             self._say(
                 "VRAM cache: phase={} - {:.1f} / {:.1f} GB free".format(
                     phase, free / 1e9, total / 1e9,
