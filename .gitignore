@@ -37,6 +37,9 @@ taming-transformers/
 # Local logs
 *.log
 
+# Per-install local settings (e.g. the fast-boot toggle)
+/settings.json
+
 # OS / editor
 Thumbs.db
 .DS_Store

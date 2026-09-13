@@ -26,7 +26,17 @@
         <button class="family-btn" data-family="deepdream">DeepDream</button>
         <button class="family-btn" data-family="style">Style Transfer</button>
       </nav>
-      <div id="engine-status" class="status status-pending">Checking engine...</div>
+      <div id="top-bar-right">
+        <label
+          id="fast-boot-toggle"
+          class="checkbox-inline"
+          title="When on, closing this window keeps the engine running in the background so the next launch can skip reloading the models. It shuts itself down automatically after 30 minutes unused, and never survives restarting your PC — turn this off to always fully close when you quit."
+        >
+          <input id="fast-boot-checkbox" type="checkbox" />
+          Fast boot
+        </label>
+        <div id="engine-status" class="status status-pending">Checking engine...</div>
+      </div>
     </header>
 
     <main id="layout">

@@ -27,6 +27,72 @@ use tauri::Manager;
 // Gradio app's default) so both can run side by side during the migration.
 const API_PORT: &str = "8420";
 
+// "Fast boot": when on, closing the window doesn't kill the Python engine —
+// it keeps running so the next launch can reconnect to it instead of paying
+// the full cold-load cost again. Two safety nets keep this from silently
+// eating resources forever: it never survives an actual OS reboot/logoff
+// (nothing OS-level preserves it — that's just how processes work, no code
+// needed), and blobvision_api.py runs its own idle-timeout thread that
+// self-exits after IDLE_TIMEOUT_SECONDS of no requests reaching it, whether
+// or not this app ever reconnects. Persisted to a plain settings.json next
+// to the repo root (not Tauri's own store plugin, to keep this one small
+// setting dependency-free) rather than only in the frontend/localStorage:
+// the decision of whether to kill on exit is made here in Rust, after the
+// window (and so localStorage) may already be gone.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Settings {
+    #[serde(default)]
+    fast_boot: bool,
+}
+
+fn settings_path(root: &Path) -> PathBuf {
+    root.join("settings.json")
+}
+
+fn read_settings(root: &Path) -> Settings {
+    fs::read_to_string(settings_path(root))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_settings(root: &Path, settings: &Settings) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(settings)
+        .expect("Settings only has plain, always-serializable fields");
+    fs::write(settings_path(root), json)
+}
+
+fn fast_boot_enabled(root: &Path) -> bool {
+    read_settings(root).fast_boot
+}
+
+#[tauri::command]
+fn get_fast_boot() -> bool {
+    fast_boot_enabled(&repo_root())
+}
+
+#[tauri::command]
+fn set_fast_boot(enabled: bool) -> Result<(), String> {
+    write_settings(&repo_root(), &Settings { fast_boot: enabled }).map_err(|e| e.to_string())
+}
+
+// A short-timeout probe, not a real health check of "is this genuinely our
+// own BlobVision engine" — if anything answers 200 on our fixed port, it's
+// overwhelmingly likely to be exactly that (a previous launch's engine kept
+// alive by fast_boot, now idling), and the cost of being wrong (skip a
+// spawn, reuse an unrelated server that happens to be on 8420 and doesn't
+// understand our routes) surfaces immediately as failed requests once the
+// frontend loads, no worse than the ordinary "engine unreachable" case
+// already handles.
+fn try_reuse_existing_engine() -> bool {
+    let url = format!("http://127.0.0.1:{}/health", API_PORT);
+    ureq::get(&url)
+        .timeout(std::time::Duration::from_millis(800))
+        .call()
+        .map(|resp| resp.status() == 200)
+        .unwrap_or(false)
+}
+
 struct PythonEngine(Mutex<Option<Child>>);
 
 // Portable path resolution: walks up from the RUNNING EXE'S OWN location
@@ -140,8 +206,13 @@ fn bootstrap_venv_if_missing(root: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn spawn_python_engine() -> std::io::Result<Child> {
+// Ok(None) means an existing engine was reused — see try_reuse_existing_engine
+// — so there's no Child for the caller to track or ever kill.
+fn spawn_python_engine() -> std::io::Result<Option<Child>> {
     let root = repo_root();
+    if fast_boot_enabled(&root) && try_reuse_existing_engine() {
+        return Ok(None);
+    }
     bootstrap_venv_if_missing(&root)?;
     // Release builds launch pythonw.exe, not python.exe — see the
     // release-mode branch below for why (a virtualenv-created venv's own
@@ -259,7 +330,7 @@ fn spawn_python_engine() -> std::io::Result<Child> {
         // fix, better than failing to launch at all over a logging nicety.
     }
 
-    cmd.spawn()
+    cmd.spawn().map(Some)
 }
 
 // Mirrors blobvision_ui.py's open_gallery(): opens the output folder in
@@ -335,7 +406,9 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             open_outputs_folder,
-            read_bootstrap_log
+            read_bootstrap_log,
+            get_fast_boot,
+            set_fast_boot
         ])
         .setup(|app| {
             // Managed empty, filled in once spawn_python_engine() actually
@@ -369,7 +442,7 @@ fn main() {
                 match result {
                     Ok(Ok(child)) => {
                         let state = handle_for_thread.state::<PythonEngine>();
-                        *state.0.lock().unwrap() = Some(child);
+                        *state.0.lock().unwrap() = child;
                     }
                     Ok(Err(err)) => {
                         write_startup_error(&format!("Failed to start blobvision_api.py: {err}"));
@@ -394,6 +467,19 @@ fn main() {
             if let tauri::RunEvent::ExitRequested { .. } = event {
                 let state = app_handle.state::<PythonEngine>();
                 let child_opt = state.0.lock().unwrap().take();
+                if fast_boot_enabled(&repo_root()) {
+                    // Leave it running — see the Settings/fast_boot doc
+                    // comment above for the two things that end it anyway
+                    // (an OS reboot, or blobvision_api.py's own idle
+                    // timeout). Just dropping child_opt here does NOT kill
+                    // it (Child has no kill-on-drop behavior), so this is
+                    // the entire "leave it alone" branch. Also skips the
+                    // uploads sweep below: the engine may still be mid-
+                    // generation against an uploaded file when the window
+                    // closes, and deleting it out from under a still-live
+                    // process is worse than a few leftover KB.
+                    return;
+                }
                 if let Some(mut child) = child_opt {
                     let _ = child.kill();
                     let _ = child.wait();
