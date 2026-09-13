@@ -1541,6 +1541,19 @@ class BlobVisionEngine:
             )
 
         with self._lock:
+            # Clear any leftover preview frame from the previous run before
+            # starting this one: the frontend starts polling these fixed
+            # filenames the instant Generate is pressed (see main.ts's
+            # startGenerationPreviewPolling), and a file left over from the
+            # last generation would otherwise be a valid image the poll
+            # happily loads and shows, flashing the old result in the output
+            # pane until the first real checkin overwrites it.
+            for _stale_name in ("_live_preview_sketch.png", "_live_preview_vqgan.png"):
+                try:
+                    os.remove(os.path.join(outputs_dir(), _stale_name))
+                except OSError:
+                    pass
+
             if init_image_path and os.path.isfile(init_image_path):
                 basename_source = basename_hint_from_upload(init_image_path)
             else:
