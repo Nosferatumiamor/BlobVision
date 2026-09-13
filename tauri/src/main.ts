@@ -1144,6 +1144,20 @@ function onStylePresetChange() {
 
 function switchFamily(family: Family) {
   exitStudioMode();
+  // showSketchPreview() shows a just-generated SDXL sketch in the img2img
+  // box for information only — it doesn't populate initImageEl.files unless
+  // "reuse img" is checked (see its own comment). Switching families with
+  // one of these unreused previews still showing left the box visually
+  // claiming to have a source image that /style/generate (or any other
+  // family's own "upload a source image" check) couldn't actually see —
+  // confirmed real bug: switching from a VQGAN redux sketch to Style
+  // Transfer, the leftover preview looked like a usable content image but
+  // generation failed asking for one to be uploaded. An actually-uploaded
+  // file (initImageEl.files populated) is left alone — carrying a real
+  // image between families to reuse as a source is intentional.
+  if (!initImageEl.files?.[0] && (!initImagePreviewEl.hidden || !initVideoPreviewEl.hidden)) {
+    clearInitImagePreview();
+  }
   currentFamily = family;
   initImageEl.accept = "image/*,video/*";
   familyBtns.forEach((btn) => btn.classList.toggle("active", btn.dataset.family === family));
@@ -2494,6 +2508,15 @@ function clearInitImagePreview() {
   videoProbeInfo = null;
   videoProbeHintEl.textContent = "";
   resetVideoRange();
+  // "custom" aspect only ever gets set as a side effect of a dropped image
+  // (see showInitImagePreview) — with the image gone there's no source to
+  // size a custom output from, so fall back to a fixed preset instead of
+  // leaving a stale "custom" selection to survive into a later, unrelated
+  // generation with no image at all. Confirmed real bug: resolve_aspect_size
+  // (blobvision_engine.py) raises "custom aspect requires source
+  // dimensions..." when a plain prompt-only generate is sent with aspect
+  // still set to "custom" from an image dropped earlier in the session.
+  if (currentAspect() === "custom") setAspect("1:1");
   updateVideoOnlyFieldsVisibility();
   updateSamToggleVisibility();
   syncOutputVisibilityForMode();
