@@ -10,11 +10,19 @@ only family-specific piece anywhere in this file).
 """
 import math
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any, Dict
 
 from blobvision_paths import VIDEO_CODECS_ROOT, build_output_name, outputs_dir, work_dir
+
+# The engine runs under pythonw.exe (no console of its own — see main.rs's
+# spawn_python_engine), so without this, Windows allocates and flashes a
+# brand new visible console for every ffmpeg/ffprobe/RIFE child process
+# spawned below — one per probe/extract/interpolate/encode call, several
+# times per video job.
+_NO_WINDOW_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 # How long a source clip can be before generate_video() callers should ask
 # for confirmation before starting (mirrors the old Gradio UI's behavior) —
@@ -71,8 +79,6 @@ def _normalize_video_clip(
     video_path, out_path, start_sec, duration_sec, target_fps, on_progress=None,
 ):
     """Re-encode a clip segment at a lower constant fps (silent proxy for frame work)."""
-    import subprocess
-
     cmd = [_find_tool("ffmpeg"), "-y", "-hide_banner", "-loglevel", "error"]
     if start_sec and float(start_sec) > 0:
         cmd.extend(["-ss", str(float(start_sec))])
@@ -91,7 +97,7 @@ def _normalize_video_clip(
         "Video: normalizing clip to {:.1f} fps — {}".format(float(target_fps), " ".join(cmd)),
         on_progress,
     )
-    subprocess.check_call(cmd)
+    subprocess.check_call(cmd, **_NO_WINDOW_KWARGS)
     if not os.path.isfile(out_path):
         raise RuntimeError("Video normalization failed: " + out_path)
     return out_path
@@ -358,13 +364,12 @@ def probe_video_file(video_path):
 
 def _probe_video(video_path):
     import json
-    import subprocess
     ffprobe = _find_tool("ffprobe")
     raw = subprocess.check_output([
         ffprobe, "-v", "error", "-select_streams", "v:0",
         "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
         "-show_entries", "format=duration", "-of", "json", video_path,
-    ], text=True)
+    ], text=True, **_NO_WINDOW_KWARGS)
     data = json.loads(raw)
     stream = (data.get("streams") or [{}])[0]
     fmt = data.get("format") or {}
@@ -407,8 +412,6 @@ def _extract_video_frames(
     output_fps=None, on_progress=None,
 ):
     """Extract frames from a clip; optional output_fps thins by time (not decode index)."""
-    import subprocess
-
     os.makedirs(out_dir, exist_ok=True)
     for stale in os.listdir(out_dir):
         if stale.lower().endswith(".png"):
@@ -430,7 +433,7 @@ def _extract_video_frames(
         cmd.extend(["-t", str(float(duration_sec))])
     cmd.extend(["-vf", vf, "-fps_mode", "vfr", pattern])
     _video_log("Video: extracting keyframes{} — {}".format(rate_note, " ".join(cmd)), on_progress)
-    subprocess.check_call(cmd)
+    subprocess.check_call(cmd, **_NO_WINDOW_KWARGS)
     frames = sorted(
         os.path.join(out_dir, n) for n in os.listdir(out_dir) if n.lower().endswith(".png")
     )
@@ -502,7 +505,6 @@ def _rife_target_frame_count(input_count, multiplier):
 
 
 def _run_rife_pass(rife_exe, input_dir, output_dir, on_progress=None, model=None, target_frames=None):
-    import subprocess
     import shutil
 
     os.makedirs(output_dir, exist_ok=True)
@@ -530,6 +532,7 @@ def _run_rife_pass(rife_exe, input_dir, output_dir, on_progress=None, model=None
         cwd=_rife_workdir(rife_exe),
         capture_output=True,
         text=True,
+        **_NO_WINDOW_KWARGS,
     )
     tail = (proc.stderr or proc.stdout or "").strip()
     if tail:
@@ -608,8 +611,6 @@ def _interpolate_video_frames_rife(input_dir, output_dir, multiplier, on_progres
 def _assemble_video_interpolated(
     proc_dir, output_path, keyframe_count, target_frame_count, clip_duration, on_progress=None,
 ):
-    import subprocess
-
     ffmpeg = _resolve_ffmpeg()
     clip_duration = max(0.05, float(clip_duration))
     keyframe_count = max(1, int(keyframe_count))
@@ -632,7 +633,7 @@ def _assemble_video_interpolated(
         "-frames:v", str(target_frame_count),
         "-pix_fmt", "yuv420p",
         output_path,
-    ])
+    ], **_NO_WINDOW_KWARGS)
 
 
 def _interpolate_to_target_count(input_dir, output_dir, target_frames, on_progress=None):
@@ -690,16 +691,14 @@ def _interpolate_video_frames(input_dir, output_dir, multiplier, fps, on_progres
 
 
 def _assemble_video(frame_dir, output_path, fps, frame_glob="out_%06d.png"):
-    import subprocess
     subprocess.check_call([
         _find_tool("ffmpeg"), "-y", "-framerate", str(float(fps)),
         "-i", os.path.join(frame_dir, frame_glob),
         "-pix_fmt", "yuv420p", output_path,
-    ])
+    ], **_NO_WINDOW_KWARGS)
 
 
 def _mux_video_audio(source_video, silent_video, output_path, clip_start=0.0, clip_duration=None):
-    import subprocess
     cmd = [
         _find_tool("ffmpeg"), "-y",
         "-i", silent_video,
@@ -714,7 +713,7 @@ def _mux_video_audio(source_video, silent_video, output_path, clip_start=0.0, cl
         "-c:v", "copy", "-c:a", "aac", "-shortest",
         output_path,
     ])
-    subprocess.check_call(cmd)
+    subprocess.check_call(cmd, **_NO_WINDOW_KWARGS)
 
 
 def _process_video(
@@ -788,6 +787,18 @@ def _run_video_job(
     function's try/finally cleanly wraps every exit path (success, error,
     or blobvision_cancel.AbortedError) around the job_dir cleanup."""
     import blobvision_cancel
+    import shutil
+
+    # Same fixed-filename live-preview trick as the still-image path (see
+    # blobvision_engine.py's _generate_sketch/generate() and generate.py's
+    # checkin()) — the frontend polls this by a known URL while the job
+    # runs. Cleared up front so a poll landing before the first keyframe is
+    # blobified gets a clean miss instead of the previous job's last frame.
+    live_preview_path = os.path.join(outputs_dir(), "_live_preview_video.png")
+    try:
+        os.remove(live_preview_path)
+    except OSError:
+        pass
 
     duration = float(info["duration"])
     frame_step = max(1, int(frame_step))
@@ -849,6 +860,13 @@ def _run_video_job(
         _video_log("Video: blobify {}/{}...".format(index + 1, len(keyframes)), on_progress)
         out_path = os.path.join(proc_dir, "proc_{:06d}.png".format(index))
         blobify_frame(frame_path, out_path)
+        # Best-effort, cosmetic only — must never be the reason a real
+        # video job fails (e.g. a transient file-lock while the frontend's
+        # own poll is mid-read of the same path).
+        try:
+            shutil.copyfile(out_path, live_preview_path)
+        except OSError:
+            pass
     silent_path = os.path.join(job_dir, "silent.mp4")
     if frame_step <= 1:
         _video_log(
