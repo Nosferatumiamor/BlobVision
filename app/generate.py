@@ -15,6 +15,8 @@ _PY_DIR = os.path.join(_SCRIPT_DIR, 'python')
 if _PY_DIR not in sys.path:
     sys.path.insert(0, _PY_DIR)
 from blobvision_paths import (
+    OPENCLIP_DEFAULT_PRETRAINED,
+    OPENCLIP_HF_REPOS,
     TAMING_REPO,
     ensure_layout,
     hf_cache_root,
@@ -133,17 +135,11 @@ perceptor = None
 clip_tokenizer = None
 make_cutouts = None
 
-OPENCLIP_DEFAULT_PRETRAINED = {
-    'ViT-L-14': 'laion2b_s32b_b82k',
-    'ViT-B-16': 'laion2b_s34b_b88k',
-    'ViT-B-32': 'laion2b_s39b_b160k',
-    'ViT-H-14': 'laion2b_s32b_b79k',
-}
-
-OPENCLIP_HF_REPOS = {
-    ('ViT-L-14', 'laion2b_s32b_b82k'): 'laion/CLIP-ViT-L-14-laion2B-s32B-b82K',
-    ('ViT-B-16', 'laion2b_s34b_b88k'): 'laion/CLIP-ViT-B-16-laion2B-s34B-b88K',
-}
+# OPENCLIP_DEFAULT_PRETRAINED / OPENCLIP_HF_REPOS: imported above from
+# blobvision_paths rather than defined here, so status/download-only callers
+# don't have to pay this module's own heavy `from taming.models import
+# cond_transformer, vqgan` import just to read a plain dict — see the
+# comment on those two names in blobvision_paths.py.
 
 
 def resolve_openclip_pretrained(model_name, pretrained_tag):

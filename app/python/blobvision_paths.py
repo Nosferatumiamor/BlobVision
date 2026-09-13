@@ -11,6 +11,33 @@ BLOBVISION_ROOT = os.path.dirname(APP_DIR)
 # Legacy alias used in older modules
 BLOBDREAM_ROOT = BLOBVISION_ROOT
 
+# Lives here rather than in app/generate.py (where it's used) because
+# openclip_weights_status()/download_openclip_weights() (blobvision_engine.py)
+# need it just to check/fetch weights on disk — importing it FROM generate.py
+# instead would drag in generate.py's own module-level `from taming.models
+# import cond_transformer, vqgan`, a genuinely heavy import (torch,
+# pytorch_lightning, the whole taming-transformers chain). That import chain
+# is also triggered by blobvision_api.py's own startup background-preload
+# thread, and Python's import lock serializes concurrent first-imports of the
+# same module — so on a fresh launch, /models/status (which gates showing the
+# "download models" panel at all) would block for as long as that background
+# preload thread was still mid-import, up to ~1 minute. Confirmed via a real
+# report: the "download models" screen sat blank behind "Engine reachable —
+# warming up..." for nearly a minute on first launch, exactly the width of
+# that background import. Keeping this constant in this dependency-free
+# module means the status check never touches that lock at all.
+OPENCLIP_DEFAULT_PRETRAINED = {
+    "ViT-L-14": "laion2b_s32b_b82k",
+    "ViT-B-16": "laion2b_s34b_b88k",
+    "ViT-B-32": "laion2b_s39b_b160k",
+    "ViT-H-14": "laion2b_s32b_b79k",
+}
+
+OPENCLIP_HF_REPOS = {
+    ("ViT-L-14", "laion2b_s32b_b82k"): "laion/CLIP-ViT-L-14-laion2B-s32B-b82K",
+    ("ViT-B-16", "laion2b_s34b_b88k"): "laion/CLIP-ViT-B-16-laion2B-s34B-b88K",
+}
+
 MODELS_ROOT = os.path.join(BLOBVISION_ROOT, "models")
 OUTPUTS_ROOT = os.path.join(BLOBVISION_ROOT, "outputs")
 # Ephemeral video-job scratch space (per-job src/processed/interpolated frame

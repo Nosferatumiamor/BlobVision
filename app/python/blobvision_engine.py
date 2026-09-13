@@ -13,6 +13,7 @@ from blobvision_paths import (
     APP_DIR,
     BLOBVISION_ROOT,
     BLOBDREAM_ROOT,
+    OPENCLIP_HF_REPOS,
     TAMING_REPO,
     basename_hint_from_upload,
     build_output_name,
@@ -886,8 +887,6 @@ _OPENCLIP_WEIGHT_FILENAMES = (
 
 
 def openclip_weights_status():
-    from generate import OPENCLIP_HF_REPOS
-
     root = openclip_root()
     for (model, tag) in OPENCLIP_HF_REPOS:
         dest = os.path.join(root, "{}__{}".format(model, tag))
@@ -897,8 +896,6 @@ def openclip_weights_status():
 
 
 def download_openclip_weights(on_progress=None):
-    from generate import OPENCLIP_HF_REPOS
-
     status = openclip_weights_status()
     if status["ready"]:
         return status
