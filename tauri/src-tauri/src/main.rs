@@ -246,6 +246,38 @@ fn spawn_python_engine() -> std::io::Result<Child> {
 // session's outputs-restructuring work — filenames carry a V/D/S/M type
 // tag instead of a subfolder), so there's no per-family subdir to resolve
 // anymore.
+// Lets the frontend show live progress during a first-run bootstrap
+// (bootstrap_venv_if_missing, above) — the ONE stretch of a launch where
+// the Python API isn't running yet at all, so there's no HTTP endpoint to
+// poll for status. logs/bootstrap.log already has everything (pip's own
+// output includes package sizes and download progress), so this just
+// tails it: pass back whatever's new since `offset` plus the file's
+// current length, so the caller can poll incrementally instead of
+// re-fetching a log that can grow to several hundred KB over a full
+// install. `Ok(("", 0))` (not an error) when the file doesn't exist yet —
+// on an ordinary launch with no bootstrap needed, it may never appear.
+#[tauri::command]
+fn read_bootstrap_log(offset: u64) -> Result<(String, u64), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = repo_root().join("logs").join("bootstrap.log");
+    let mut file = match File::open(&path) {
+        Ok(f) => f,
+        Err(_) => return Ok((String::new(), 0)),
+    };
+    let len = file.metadata().map_err(|e| e.to_string())?.len();
+    // The log can be recreated (a later relaunch re-running bootstrap)
+    // between polls — an offset past the new file's end means "start over"
+    // rather than seeking past EOF.
+    let start = if offset > len { 0 } else { offset };
+    file.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    // from_utf8_lossy rather than read_to_string: this can race the
+    // writer mid-append, landing exactly inside a multi-byte UTF-8
+    // sequence — a hard error there would just make the poll flap.
+    Ok((String::from_utf8_lossy(&buf).into_owned(), len))
+}
+
 #[tauri::command]
 fn open_outputs_folder() -> Result<(), String> {
     let out_dir = repo_root().join("outputs");
@@ -259,7 +291,7 @@ fn open_outputs_folder() -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![open_outputs_folder])
+        .invoke_handler(tauri::generate_handler![open_outputs_folder, read_bootstrap_log])
         .setup(|app| {
             // Managed empty, filled in once spawn_python_engine() actually
             // finishes — see the background thread below for why this
