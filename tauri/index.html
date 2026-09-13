@@ -7,6 +7,9 @@
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
+    <div id="splash-screen">
+      <img src="/src/blob-splash.jpg" alt="BlobVision" />
+    </div>
     <header id="top-bar">
       <div class="brand">
         <img src="/src/blob-logo.png" alt="" class="blob-logo" />
@@ -30,10 +33,10 @@
         <label
           id="fast-boot-toggle"
           class="checkbox-inline"
-          title="When on, closing this window keeps the engine running in the background so the next launch can skip reloading the models. It shuts itself down automatically after 30 minutes unused, and never survives restarting your PC — turn this off to always fully close when you quit."
+          title="Keeps the models loaded for 30 minutes if you closed the program by accident."
         >
           <input id="fast-boot-checkbox" type="checkbox" />
-          Fast boot
+          Fast reboot
         </label>
         <div id="engine-status" class="status status-pending">Checking engine...</div>
       </div>
