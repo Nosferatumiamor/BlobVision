@@ -96,6 +96,18 @@ fn find_python_exe(root: &Path, name: &str) -> Option<PathBuf> {
 // needing its own separate "have we already done this" flag.
 fn bootstrap_venv_if_missing(root: &Path) -> std::io::Result<()> {
     if find_python_exe(root, "python.exe").is_some() {
+        // No bootstrap needed this launch — but logs/bootstrap.log from a
+        // PAST bootstrap can still be sitting on disk from last time, and
+        // read_bootstrap_log has no way to tell "stale leftover" apart
+        // from "actively being written right now": the frontend's first
+        // poll (offset 0) would read that whole old file and flash the
+        // "Setting up Python environment..." panel with its old content
+        // for a couple seconds before /health succeeds and it's hidden
+        // again — confirmed real bug, on every ordinary relaunch, despite
+        // the panel's own copy claiming "every future launch skips this
+        // entirely." Deleting it here means a genuinely fresh log only
+        // ever exists while bootstrap_venv.ps1 is actually running below.
+        let _ = fs::remove_file(root.join("logs").join("bootstrap.log"));
         return Ok(());
     }
     let script = root.join("app").join("scripts").join("bootstrap_venv.ps1");

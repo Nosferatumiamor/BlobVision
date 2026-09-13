@@ -1740,27 +1740,37 @@ def main():
         # taming, CLIP, open_clip, kornia, torch_optimizer, lion_pytorch):
         # /warmup/vqgan's _ensure_vqgan() does `import generate as eng`
         # lazily too, so that import cost was ALSO paid silently, inside
-        # whichever request happened to trigger it first. Chained after
-        # the diffusers/transformers preload above (same thread, same
-        # lock held throughout) rather than run concurrently with it:
-        # the two import largely disjoint library trees, but there's no
-        # benefit to risking a second, harder-to-reproduce cross-import
-        # race for a step that's a fair bit smaller anyway.
+        # whichever request happened to trigger it first. Deliberately
+        # OUTSIDE _engine._lock (unlike the diffusers/transformers import
+        # above): taming/CLIP/kornia is a disjoint library tree from
+        # diffusers/transformers, so there's no shared partial-init risk
+        # with /warmup/sdxl's own import — and generate.py racing ITSELF
+        # (this background import vs. a concurrent _ensure_vqgan() call)
+        # is already safe on its own, since CPython's own import system
+        # serializes concurrent first-imports of the SAME module across
+        # threads. Chaining it under the shared lock anyway (an earlier,
+        # more conservative version of this code did) meant /warmup/sdxl's
+        # own `with _engine._lock:` sat blocked for this entire step too,
+        # even though it never touches generate.py at all — confirmed on a
+        # real session's log as ~16s directly on the "Loading models..."
+        # critical path on every fresh launch. Freed from the lock, it now
+        # runs concurrently with SDXL's own (much longer) disk read + GPU
+        # upload instead of serializing before it.
         def _background_preload():
             print("Background: preloading diffusers/transformers (offline)...", flush=True)
             with _engine._lock:
                 _preload_hf_imports()
                 print("Background: diffusers/transformers preload done.", flush=True)
-                try:
-                    print("Background: preloading VQGAN deps (taming/CLIP/kornia)...", flush=True)
-                    import generate  # noqa: F401
-                    print("Background: VQGAN deps preload done.", flush=True)
-                except Exception as exc:
-                    # Never let a background preload hiccup take down the
-                    # whole process — worst case, /warmup/vqgan just pays
-                    # this import cost itself later, same as before this
-                    # change existed.
-                    print("Background: VQGAN deps preload failed (non-fatal): {}: {}".format(type(exc).__name__, exc), flush=True)
+            try:
+                print("Background: preloading VQGAN deps (taming/CLIP/kornia)...", flush=True)
+                import generate  # noqa: F401
+                print("Background: VQGAN deps preload done.", flush=True)
+            except Exception as exc:
+                # Never let a background preload hiccup take down the
+                # whole process — worst case, /warmup/vqgan just pays
+                # this import cost itself later, same as before this
+                # change existed.
+                print("Background: VQGAN deps preload failed (non-fatal): {}: {}".format(type(exc).__name__, exc), flush=True)
 
         threading.Thread(target=_background_preload, daemon=True).start()
     print("BlobVision API ready:")
