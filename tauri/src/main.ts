@@ -650,6 +650,20 @@ interface ModelStatus {
 // reachable, and again after any install run.
 let modelsStatusCache: Record<ModelKey, ModelStatus> | null = null;
 
+// A target's "ready" flag from the backend can go true before its download
+// actually finishes: e.g. SDXL Turbo's readiness check looks for
+// model_index.json (diffusers' own manifest), which a snapshot_download can
+// write to disk well before the multi-GB weight shards land, and
+// OpenCLIP's check is "destination dir is non-empty" for the same reason.
+// installing (driven by this app's own /models/install thread tracking, not
+// a filesystem heuristic) doesn't have that race, so treat a target as
+// genuinely done only once BOTH agree — otherwise a still-downloading SDXL
+// could get struck through as done in the panel, or get warmed up against
+// an incomplete set of files.
+function modelDone(status: ModelStatus): boolean {
+  return status.ready && !status.installing;
+}
+
 // Which gated models a family's OWN warmup needs — used to decide whether
 // to even attempt it. DeepDream isn't listed: its GoogLeNet weights come
 // from torchvision's own hub, unaffected by the HF_HUB_OFFLINE/
@@ -657,8 +671,8 @@ let modelsStatusCache: Record<ModelKey, ModelStatus> | null = null;
 // huggingface_hub-based fetches), so it always just works.
 function familyModelsReady(family: Family): boolean {
   if (!modelsStatusCache) return true; // unknown — don't block on a fluke
-  if (family === "vqgan") return modelsStatusCache.vqgan.ready;
-  if (family === "style") return modelsStatusCache.style.ready;
+  if (family === "vqgan") return modelDone(modelsStatusCache.vqgan);
+  if (family === "style") return modelDone(modelsStatusCache.style);
   return true;
 }
 
@@ -673,8 +687,21 @@ function familyModelsReady(family: Family): boolean {
 // blobvision_api.py's _model_installing guard).
 let pendingInstallTargets: Set<ModelKey> = new Set();
 
+// Where to grab each model by hand and where it belongs, for when every
+// automated source is unreachable (proxy/firewall, all mirrors down, etc.)
+// — shown alongside a failed download so the user isn't stuck with no
+// path forward besides retrying the same broken sources.
+const MODEL_MANUAL_FALLBACK: Record<ModelKey, string> = {
+  sdxl:
+    'Manual fallback: download "stabilityai/sdxl-turbo" from huggingface.co and copy its files into models/sdxl-turbo/ next to the app.',
+  vqgan:
+    "Manual fallback: get config.yaml + model.ckpt from huggingface.co/boris/vqgan_f16_16384 (or the heibox.uni-heidelberg.de mirror) and place them in models/vqgan/ as vqgan_imagenet_f16_16384.yaml and .ckpt. The CLIP weights come from huggingface.co/laion/CLIP-ViT-L-14-laion2B-s32B-b82K into models/open_clip/.",
+  style:
+    "Manual fallback: VGG19 normally downloads from download.pytorch.org via torchvision — if that's blocked, fetch vgg19-dcbb9e9d.pth from there directly and place it in models/style-transfer/vgg19_imagenet.pth.",
+};
+
 function describeModelStatus(key: ModelKey, status: ModelStatus): string {
-  if (status.ready) return key + ": done";
+  if (modelDone(status)) return key + ": done";
   if (status.progress && status.progress.startsWith("Failed:")) return key + ": " + status.progress;
   if (status.installing) return status.progress ? key + ": " + status.progress : key + ": starting…";
   return key + ": queued";
@@ -688,27 +715,29 @@ async function refreshModelsInstallPanel(): Promise<boolean> {
     return true; // can't tell — don't block startStagedWarmup on a fluke
   }
   modelsStatusCache = status;
-  const allReady = status.sdxl.ready && status.vqgan.ready && status.style.ready;
+  const allReady = (Object.keys(MODEL_CHECKBOXES) as ModelKey[]).every((key) => modelDone(status[key]));
   modelsInstallPanelEl.hidden = allReady;
   (Object.keys(MODEL_CHECKBOXES) as ModelKey[]).forEach((key) => {
     const cb = MODEL_CHECKBOXES[key];
-    const ready = status[key].ready;
-    cb.checked = !ready;
-    cb.disabled = ready || status[key].installing;
-    cb.parentElement!.classList.toggle("models-install-row-done", ready);
+    const done = modelDone(status[key]);
+    cb.checked = !done;
+    cb.disabled = status[key].ready || status[key].installing;
+    cb.parentElement!.classList.toggle("models-install-row-done", done);
   });
 
   if (pendingInstallTargets.size > 0) {
     modelsInstallStatusEl.hidden = false;
-    modelsInstallStatusEl.textContent = Array.from(pendingInstallTargets)
-      .map((key) => describeModelStatus(key, status[key]))
-      .join(" · ");
+    const failedTargets = Array.from(pendingInstallTargets).filter(
+      (key) => !status[key].installing && !modelDone(status[key]),
+    );
+    modelsInstallStatusEl.textContent =
+      Array.from(pendingInstallTargets)
+        .map((key) => describeModelStatus(key, status[key]))
+        .join(" · ") + (failedTargets.length > 0 ? "\n" + failedTargets.map((key) => MODEL_MANUAL_FALLBACK[key]).join("\n") : "");
     const stillGoing = Array.from(pendingInstallTargets).some((key) => status[key].installing);
     if (!stillGoing) {
       modelsInstallBtnEl.disabled = false;
-      const anyFailed = Array.from(pendingInstallTargets).some(
-        (key) => !status[key].ready && !status[key].installing,
-      );
+      const anyFailed = failedTargets.length > 0;
       pendingInstallTargets = new Set();
       if (!anyFailed) {
         modelsInstallStatusEl.hidden = true;
