@@ -78,12 +78,17 @@ fn set_fast_boot(enabled: bool) -> Result<(), String> {
 
 // A short-timeout probe, not a real health check of "is this genuinely our
 // own BlobVision engine" — if anything answers 200 on our fixed port, it's
-// overwhelmingly likely to be exactly that (a previous launch's engine kept
-// alive by fast_boot, now idling), and the cost of being wrong (skip a
-// spawn, reuse an unrelated server that happens to be on 8420 and doesn't
-// understand our routes) surfaces immediately as failed requests once the
-// frontend loads, no worse than the ordinary "engine unreachable" case
-// already handles.
+// overwhelmingly likely to be exactly that: either a previous launch's
+// engine kept alive by fast_boot, now idling, or (fast_boot off) one
+// orphaned by a hard crash that skipped our own ExitRequested cleanup —
+// normal graceful exits already kill the engine first, so nothing should
+// be listening here in the ordinary fast_boot-off case. Either way, the
+// cost of being wrong (skip a spawn, reuse an unrelated server that happens
+// to be on 8420 and doesn't understand our routes) surfaces immediately as
+// failed requests once the frontend loads, no worse than the ordinary
+// "engine unreachable" case already handles — versus the alternative of
+// blindly spawning a second engine that fails to bind the port an orphaned
+// one is still holding, leaving the app stuck unable to relaunch at all.
 fn try_reuse_existing_engine() -> bool {
     let url = format!("http://127.0.0.1:{}/health", API_PORT);
     ureq::get(&url)
@@ -210,7 +215,11 @@ fn bootstrap_venv_if_missing(root: &Path) -> std::io::Result<()> {
 // — so there's no Child for the caller to track or ever kill.
 fn spawn_python_engine() -> std::io::Result<Option<Child>> {
     let root = repo_root();
-    if fast_boot_enabled(&root) && try_reuse_existing_engine() {
+    // Tried unconditionally, not just when fast_boot is on: with it off, a
+    // graceful exit already kills the engine, so this is a quick miss in
+    // the ordinary case — but it's the only thing standing between a
+    // crash-orphaned engine and an unbindable port on the next launch.
+    if try_reuse_existing_engine() {
         return Ok(None);
     }
     bootstrap_venv_if_missing(&root)?;
