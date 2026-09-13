@@ -1,9 +1,11 @@
 """BlobVision unified generation engine (Legacy / Redux / Corrupt)."""
+import contextlib
 import gc
 import math
 import os
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -854,11 +856,12 @@ def download_sdxl_weights(on_progress=None):
 
     out_dir = sdxl_model_dir()
     os.makedirs(out_dir, exist_ok=True)
-    snapshot_download(
-        "stabilityai/sdxl-turbo",
-        local_dir=out_dir,
-        ignore_patterns=["*.md", "*.pdf", "*.png", "*.jpg", "*.webp"],
-    )
+    with _progress_heartbeat(on_progress, "Downloading SDXL Turbo (~6.5 GB)"):
+        snapshot_download(
+            "stabilityai/sdxl-turbo",
+            local_dir=out_dir,
+            ignore_patterns=["*.md", "*.pdf", "*.png", "*.jpg", "*.webp"],
+        )
     if on_progress:
         on_progress("SDXL Turbo installed.")
     return sdxl_weights_status()
@@ -890,9 +893,8 @@ def download_openclip_weights(on_progress=None):
         dest = os.path.join(root, "{}__{}".format(model, tag))
         if os.path.isdir(dest) and os.listdir(dest):
             continue
-        if on_progress:
-            on_progress("Downloading CLIP weights: {}...".format(repo_id))
-        snapshot_download(repo_id=repo_id, local_dir=dest)
+        with _progress_heartbeat(on_progress, "Downloading CLIP weights: {}".format(repo_id)):
+            snapshot_download(repo_id=repo_id, local_dir=dest)
     if on_progress:
         on_progress("CLIP weights installed.")
     return openclip_weights_status()
@@ -917,6 +919,8 @@ _VQGAN_HEIBOX_CKPT_URL = (
     "https://heibox.uni-heidelberg.de/d/a7530b09fed84f80a887/files/?p=%2Fckpts%2Flast.ckpt&dl=1"
 )
 _VQGAN_HF_MIRROR_REPO = "boris/vqgan_f16_16384"
+_VQGAN_HF_CONFIG_URL = "https://huggingface.co/{}/resolve/main/config.yaml".format(_VQGAN_HF_MIRROR_REPO)
+_VQGAN_HF_CKPT_URL = "https://huggingface.co/{}/resolve/main/model.ckpt".format(_VQGAN_HF_MIRROR_REPO)
 _VQGAN_CKPT_MIN_BYTES = 500 * 1024 * 1024  # real file is ~980MB; well short of that means a bad/partial download
 
 
@@ -929,6 +933,34 @@ def vqgan_checkpoint_status():
         and os.path.getsize(ckpt) >= _VQGAN_CKPT_MIN_BYTES
     )
     return {"ready": ready, "path": ckpt}
+
+
+@contextlib.contextmanager
+def _progress_heartbeat(on_progress, label, interval=4):
+    """snapshot_download/hf_hub_download only report progress via their own
+    internal tqdm bar (stderr), with no callback hook we can feed into
+    on_progress — so a large multi-file download would otherwise sit on one
+    static message for minutes with zero visible movement in the install
+    panel, indistinguishable from a hang. Re-announces the same label with
+    elapsed time on a timer so the panel visibly keeps moving even without
+    real byte-level progress."""
+    if on_progress is None:
+        yield
+        return
+    stop = threading.Event()
+    start = time.time()
+
+    def tick():
+        while not stop.wait(interval):
+            on_progress("{} ({:.0f}s elapsed)".format(label, time.time() - start))
+
+    t = threading.Thread(target=tick, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=1)
 
 
 def _stream_download(url, dest_path, on_progress=None, label=""):
@@ -959,21 +991,17 @@ def _download_vqgan_from_heibox(cfg, ckpt, on_progress=None):
 
 
 def _download_vqgan_from_hf_mirror(cfg, ckpt, on_progress=None):
-    enable_hub_downloads()
-    from huggingface_hub import hf_hub_download
-
-    out_dir = os.path.dirname(ckpt)
-    os.makedirs(out_dir, exist_ok=True)
-    if on_progress:
-        on_progress("VQGAN checkpoint (Hugging Face mirror): config...")
-    got_cfg = hf_hub_download(_VQGAN_HF_MIRROR_REPO, filename="config.yaml", local_dir=out_dir)
-    if os.path.abspath(got_cfg) != os.path.abspath(cfg):
-        os.replace(got_cfg, cfg)
-    if on_progress:
-        on_progress("VQGAN checkpoint (Hugging Face mirror): ~980 MB checkpoint...")
-    got_ckpt = hf_hub_download(_VQGAN_HF_MIRROR_REPO, filename="model.ckpt", local_dir=out_dir)
-    if os.path.abspath(got_ckpt) != os.path.abspath(ckpt):
-        os.replace(got_ckpt, ckpt)
+    # Deliberately a plain streamed GET against HF's resolve URL rather than
+    # hf_hub_download: the latter reports progress only via its own internal
+    # tqdm bar (stderr), with no callback hook we can feed into on_progress,
+    # so the UI would sit on one static "downloading..." message for the
+    # entire ~980MB transfer with no visible movement — exactly what made a
+    # real, working download look indistinguishable from a hang. This reuses
+    # the same percentage-reporting _stream_download the heibox source uses.
+    _stream_download(_VQGAN_HF_CONFIG_URL, cfg, on_progress, "VQGAN config (Hugging Face mirror)")
+    _stream_download(_VQGAN_HF_CKPT_URL, ckpt, on_progress, "VQGAN checkpoint (Hugging Face mirror)")
+    if os.path.getsize(ckpt) < _VQGAN_CKPT_MIN_BYTES:
+        raise IOError("Downloaded VQGAN checkpoint from the Hugging Face mirror is too small — likely an error page, not the real file.")
 
 
 def download_vqgan_checkpoint(on_progress=None):

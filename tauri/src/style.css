@@ -609,6 +609,7 @@ select {
 #models-install-status {
   margin: 0;
   text-align: center;
+  white-space: pre-line;
 }
 
 .corner-icon-btn {
