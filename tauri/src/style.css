@@ -499,6 +499,69 @@ select {
   50% { opacity: 0.35; transform: scale(0.7); }
 }
 
+/* Shown before the engine is even reachable, only during a genuine
+   first-run bootstrap (bootstrap_venv_if_missing in main.rs) — the one
+   phase with no HTTP endpoint to poll, so progress comes from tailing
+   logs/bootstrap.log instead (see pollBootstrapLog). Wider than the other
+   two output-canvas panels since it needs room for a real console block,
+   not just a line or two of text. */
+#bootstrap-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.5rem;
+  width: min(94%, 34rem);
+  max-height: 90%;
+  padding: 1rem 1.25rem;
+  border-radius: 8px;
+  border: 1px solid var(--warn);
+  background: var(--panel);
+}
+
+.bootstrap-title {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--warn);
+}
+
+#bootstrap-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--warn);
+  animation: output-loading-pulse 1.1s ease-in-out infinite;
+}
+
+.bootstrap-hint {
+  margin: 0 0 0.3rem;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  color: var(--muted);
+}
+
+#bootstrap-console {
+  margin: 0;
+  flex: 1;
+  min-height: 8rem;
+  max-height: 22rem;
+  overflow-y: auto;
+  padding: 0.6rem 0.7rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #0b0c10;
+  color: #c9d1d9;
+  font-family: "Consolas", "SF Mono", Menlo, monospace;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+  text-align: left;
+}
+
 /* Shown instead of the loading banner when a model isn't just still
    warming up but genuinely isn't on disk yet — a fresh install has none of
    these bundled (see app/scripts/download_*.py), so this is the in-app

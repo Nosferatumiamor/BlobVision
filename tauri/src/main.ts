@@ -403,6 +403,8 @@ const genStatusFillEl = $<HTMLDivElement>("#gen-status-fill");
 const genStatusTextEl = $<HTMLSpanElement>("#gen-status-text");
 const outputHintEl = $<HTMLParagraphElement>("#output-hint");
 const outputLoadingBannerEl = $<HTMLParagraphElement>("#output-loading-banner");
+const bootstrapPanelEl = $<HTMLDivElement>("#bootstrap-panel");
+const bootstrapConsoleEl = $<HTMLPreElement>("#bootstrap-console");
 const modelsInstallPanelEl = $<HTMLDivElement>("#models-install-panel");
 const modelsCbSdxlEl = $<HTMLInputElement>("#models-cb-sdxl");
 const modelsCbVqganEl = $<HTMLInputElement>("#models-cb-vqgan");
@@ -526,9 +528,13 @@ function familyModeBlurb(): string {
 // multi-minute wait in a session (real user feedback).
 function updateOutputHint() {
   if (!outputImageEl.hidden || !outputVideoEl.hidden) return;
-  // The install panel already explains why nothing's loading — stacking
-  // the loading banner/hint underneath it would just be noise.
-  if (!modelsInstallPanelEl.hidden) {
+  // Both alternate panels already explain why nothing's loading — stacking
+  // the loading banner/hint underneath either would just be noise. The
+  // bootstrap console (no engine reachable at all yet) takes priority over
+  // the models panel (engine reachable, but some weights missing) since
+  // they can never both be genuinely relevant at once — the first only
+  // shows pre-/health, the second only after it.
+  if (!bootstrapPanelEl.hidden || !modelsInstallPanelEl.hidden) {
     outputHintEl.hidden = true;
     outputLoadingBannerEl.hidden = true;
     return;
@@ -715,6 +721,34 @@ modelsInstallBtnEl.addEventListener("click", async () => {
   setTimeout(poll, 5000);
 });
 
+// Tails logs/bootstrap.log via the Rust side (read_bootstrap_log in
+// main.rs) — the one phase with no HTTP endpoint to poll, since the
+// Python API doesn't exist yet at all while this runs. Silently a no-op
+// (returns false, touches nothing) on an ordinary launch where the file
+// never appears, so this is safe to call on every waitForEngine tick
+// regardless of whether this launch is actually bootstrapping.
+let bootstrapLogOffset = 0;
+async function pollBootstrapLog(): Promise<boolean> {
+  let text: string;
+  let newOffset: number;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    [text, newOffset] = await invoke<[string, number]>("read_bootstrap_log", {
+      offset: bootstrapLogOffset,
+    });
+  } catch {
+    return false;
+  }
+  if (newOffset < bootstrapLogOffset) bootstrapConsoleEl.textContent = ""; // log was recreated
+  bootstrapLogOffset = newOffset;
+  if (!text) return !bootstrapPanelEl.hidden;
+  bootstrapPanelEl.hidden = false;
+  bootstrapConsoleEl.textContent += text;
+  bootstrapConsoleEl.scrollTop = bootstrapConsoleEl.scrollHeight;
+  updateOutputHint();
+  return true;
+}
+
 async function waitForEngine() {
   const start = Date.now();
   const deadline = start + ENGINE_STARTUP_TIMEOUT_MS;
@@ -723,6 +757,7 @@ async function waitForEngine() {
     try {
       await fetchJson("/health");
       setEngineStatus("Engine reachable — warming up...", "status-ok");
+      bootstrapPanelEl.hidden = true;
       // NOT generateBtn.disabled = false here — the backend responding to
       // /health just means the process is up, not that any model has
       // actually loaded yet (that's startStagedWarmup(), which can take
@@ -738,7 +773,8 @@ async function waitForEngine() {
       // background (bootstrap_venv_if_missing in main.rs). Only escalate
       // the message once we're past how long an ordinary launch ever
       // takes, so this doesn't cry wolf on every normal startup.
-      if (!shownSlowHint && Date.now() - start > ENGINE_STARTUP_SLOW_HINT_MS) {
+      const isBootstrapping = await pollBootstrapLog();
+      if (!shownSlowHint && (isBootstrapping || Date.now() - start > ENGINE_STARTUP_SLOW_HINT_MS)) {
         shownSlowHint = true;
         setEngineStatus(
           "Still starting… first launch can take up to ~30 min while a Python environment downloads.",

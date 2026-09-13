@@ -163,6 +163,15 @@
       <section id="preview">
         <div id="preview-main">
           <div id="output-canvas">
+            <div id="bootstrap-panel" hidden>
+              <p class="bootstrap-title"><span id="bootstrap-dot"></span>Setting up Python environment…</p>
+              <p class="bootstrap-hint">
+                First launch only — downloading Python and about 150 packages
+                (several GB). This can take up to ~30 minutes depending on
+                your connection; every future launch skips this entirely.
+              </p>
+              <pre id="bootstrap-console"></pre>
+            </div>
             <div id="models-install-panel" hidden>
               <p class="models-install-title">Model weights not installed</p>
               <p class="models-install-hint">
