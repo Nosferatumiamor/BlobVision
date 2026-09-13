@@ -4478,10 +4478,26 @@ videoCodecsInstallBtnEl.addEventListener("click", async () => {
     videoCodecsInstallBtnEl.textContent = "Install codecs";
     return;
   }
+  // Polls bundled_ready specifically, NOT the more permissive `ready` that
+  // refreshVideoCodecsGate()/videoCodecsReady track (which also counts a
+  // system ffmpeg found on PATH) — confirmed real bug: on a machine with
+  // one already on PATH, `ready` was true from the very first poll, so
+  // this button's own progress tracking flipped back to "Install codecs"
+  // almost instantly regardless of whether the actual bundled download
+  // (started server-side) had made any progress at all, making a genuine
+  // multi-second/minute download look like it did nothing.
   const poll = async () => {
+    let bundledReady = false;
+    try {
+      const status = await fetchJson("/video/codecs/status");
+      bundledReady = !!status.bundled_ready;
+    } catch {
+      // keep polling — a transient fetch failure isn't "done"
+    }
     await refreshVideoCodecsGate();
-    if (videoCodecsReady) {
+    if (bundledReady) {
       videoCodecsInstallBtnEl.textContent = "Install codecs";
+      videoCodecsInstallBtnEl.disabled = false;
       return;
     }
     setTimeout(poll, 3000);
