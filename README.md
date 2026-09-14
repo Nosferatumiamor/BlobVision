@@ -54,6 +54,18 @@ of them actually worked (spoiler: still don't).
 
 ## How to use it
 
+**WARNING**
+
+The initial boot is slow: it loads SDXL and the legacy models, and depending
+on your setup (drive speed especially) that can vary a lot. Once the splash
+screen fades, the engine and models keep loading in the background; once
+**DEGENERATE** lights up, you can already type in a prompt, it'll just queue
+until everything's ready. Once loaded, you're set; tick **Fast reboot** if
+you want the next launch to skip all this. Generations themselves still take
+real time, but you'll see them happen live, step by step. And if anything
+feels too slow (video source clips especially), **Cancel** works at any
+point.
+
 Once weights are installed and the engine's ready (the badge in the top-right
 turns green), the basic loop is: pick a family, write a prompt (or drop in an
 image or video) and hit **DEGENERATE**.
