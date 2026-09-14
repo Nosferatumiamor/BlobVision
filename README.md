@@ -6,6 +6,10 @@ were using around 2021–2022, back when a single GPU and an afternoon of patien
 were the whole toolkit), wrapped in a single UI with a modern SDXL Turbo sketch
 step in front of them to make composition steerable.
 
+<p align="center">
+  <img src="tauri/src/blob-splash.jpg" width="600" alt="BlobVision splash screen">
+</p>
+
 ## What it does
 
 BlobVision lets you recreate the disgusting results of the first publicly
@@ -107,13 +111,16 @@ learn it is to just start dropping prompts and images in.
 
 ## Hardware & requirements
 
-- **Windows only.** There is no macOS or Linux build, and none is planned.
+- **Windows only.** There is no macOS or Linux build, and none is planned, at
+  least for the moment. Feel free to create a fork for those systems.
 - **An NVIDIA GPU is effectively required.** There is no practical CPU-only path;
   every mode leans on CUDA for anything resembling reasonable speed.
 - Developed and tested on an **NVIDIA RTX 3060 (12 GB VRAM)** with **32 GB of
   system RAM**. A GPU with at least 12 GB of VRAM is recommended for smooth
   results across all three families; less will work but speed and maximum output
-  size will vary a lot depending on your own hardware.
+  size will vary a lot depending on your own hardware. Feel free to try it on
+  different hardware; and if you've got the patience for it, please take the
+  time to share your results.
 - **BlobVision runs entirely offline** once its models are installed; nothing
   you generate is ever sent anywhere. Weights are only downloaded once each and
   cached locally.
