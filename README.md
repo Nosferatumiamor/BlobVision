@@ -8,7 +8,9 @@ step in front of them to make composition steerable.
 
 ## What it does
 
-BlobVision runs three independent AI "families," switchable in the UI:
+BlobVision lets you recreate the disgusting results of the first publicly
+released AIs, back when a shapeless blob made tech nerds howl with excitement
+about the revolution to come. The historic models on offer:
 
 - **VQGAN+CLIP** — the original text-to-image approach from before diffusion models
   took over: a VQGAN image decoder is nudged, one optimization step at a time,
@@ -23,18 +25,28 @@ BlobVision runs three independent AI "families," switchable in the UI:
 
 ### REDUX vs. Legacy — the actual principle
 
-Each family has two ways to run:
+Each one comes in two modes:
 
-- **Legacy** mode is the real, historic pipeline: the old model works from
-  scratch (or from your own uploaded image) with no help from anything modern.
-  Authentic, but slow and hard to steer toward a specific composition.
-- **REDUX** mode (the fast default) puts **SDXL Turbo** in front: it generates a
-  clean sketch from your prompt in about a second, and *that* sketch is what the
-  old model then processes. SDXL only decides composition — the old model still
-  does all the actual "look," so the output still has the VQGAN/DeepDream/VGG19
-  aesthetic, just steerable by a text prompt instead of pure chance.
+- **Legacy**, faithful to how the model originally worked — from scratch, or
+  from your own uploaded image. Authentic, but slow and hard to steer toward
+  a specific composition.
+- **Redux** (the fast default), which puts **SDXL Turbo** in front and gets
+  you a few extra things:
+  - Better prompt understanding, by running an SDXL Turbo pass first — it
+    only decides composition, the old model still does all the actual
+    "look," so the output keeps its VQGAN/DeepDream/VGG19 aesthetic, just
+    steerable by a text prompt instead of pure chance.
+  - A choice of aspect ratios.
+  - The ability to convert videos too (we don't recommend going past 30s —
+    it's not built for that and will make you regret it).
 
 That's the whole idea: modern model for control, historic model for the look.
+
+Don't be shy about cranking the extreme settings — DeepDream's **Intensity**
+in **mixed6a** mode especially, or VQGAN's **Deslop**. Also take a look at
+the **Grimoire**, a curated stash of incantations for prompts and negative
+prompts pulled straight from historic practice — nobody really knows if any
+of them actually worked (spoiler: still don't).
 
 ## How to use it
 
@@ -74,9 +86,14 @@ image or video — and hit **DEGENERATE**.
   check Reuse seed to carry the last one into the next generation.
 - **Gallery** browses everything generated this session; **Cancel** stops
   whatever's currently running, image or video.
-- **Fast reboot** (top right) keeps the engine warm in the background for 30
-  minutes after you close the window, so a quick re-open skips reloading
-  every model from scratch.
+- **Fast reboot** (top right) — BlobVision's initial load is fairly slow. If
+  you expect to be going in and out of the program a lot, or you're worried
+  it might close by accident, or you're scared of closing it and regretting
+  it, this keeps everything loaded for 30 minutes after you close it, so
+  relaunching is instant. Just understand what that means: for those 30
+  minutes after closing, the program is still holding onto the resources it
+  needs — so use it wisely, and if you're done for the session, uncheck it
+  if you're sure you won't need it again.
 
 Nothing here is destructive or hard to undo, so the fastest way to actually
 learn it is to just start dropping prompts and images in.
@@ -103,10 +120,10 @@ learn it is to just start dropping prompts and images in.
    run it. It'll ask where to install and shows real progress as it goes,
    including a first-run download of a private Python environment and PyTorch
    (several GB — see the installer's own notice for details).
-   Windows will likely show a **SmartScreen** warning ("Windows protected
-   your PC") the first time, since the installer isn't code-signed — this is
-   normal for a small, free tool distributed this way. Click **More info →
-   Run anyway** to proceed.
+   BlobVision is an indie, hand-tinkered program, and Windows gets spooked
+   when you launch it and throws up its **SmartScreen** warning ("Windows
+   protected your PC") — click **More info → Run anyway**, the program isn't
+   going to break anything, no need to panic.
 2. First launch also lets you pick which model weights to fetch (SDXL Turbo,
    VQGAN+CLIP, Style Transfer) — check whichever you want, skip the rest for
    now, install more later from the same panel.
