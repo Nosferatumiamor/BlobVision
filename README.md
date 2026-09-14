@@ -78,9 +78,16 @@ image or video — and hit **DEGENERATE**.
   live as it comes in.
 - **Steps/Blob** and **Deslop** (VQGAN) control how long the optimization
   loop runs and, in img2img, how much of the source survives. DeepDream has
-  its own **Inception layer** / **Intensity** pair; Style Transfer has
-  **Style strength** / **Content fidelity** / **Steps**, or an **SDXL
-  preset** shortcut instead of the classic, much slower optimization.
+  its own **Inception layer** / **Intensity** pair.
+- **Style Transfer works differently from the other two — no prompt.** You
+  need a source image (or video) in the **img2img** frame on the right, and
+  a style reference image in the **Style reference** box on the left, under
+  Degenerate. That's the classic way this tool works, but since its results
+  are hit-or-miss, there's also a "stronger" variant: the **SDXL presets** in
+  the right sidebar. Check the box next to **SDXL preset** to turn them on,
+  then pick one from the dropdown right below it. Play with **Strength**
+  too — low (0.10–0.20) keeps the image recognizable, push it toward 0.90
+  and the AI reinvents it completely.
 - **Upscale x2 / x4** runs the result through Real-ESRGAN afterward.
 - **Seed** — pin a value and uncheck Random seed to reproduce a result, or
   check Reuse seed to carry the last one into the next generation.
