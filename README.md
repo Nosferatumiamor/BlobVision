@@ -121,6 +121,54 @@ image or video) and hit **DEGENERATE**.
 Nothing here is destructive or hard to undo, so the fastest way to actually
 learn it is to just start dropping prompts and images in.
 
+## Examples
+
+### VQGAN+CLIP
+
+<p align="center">
+  <img src="assets/readme/vqgan-redux-1.png" width="47%">
+  <img src="assets/readme/vqgan-redux-2.png" width="47%">
+</p>
+
+Redux mode: SDXL feeds VQGAN a rough composition, VQGAN does the rest.
+
+<p align="center">
+  <img src="assets/readme/vqgan-redux-example.jpg" width="30%">
+  <img src="assets/readme/vqgan-legacy-example.jpg" width="30%">
+</p>
+
+Left, a Redux output; right, pure Legacy mode (no SDXL sketch involved) doing
+what it does best: the cathedral-of-flesh-and-bones school of VQGAN.
+
+<p align="center">
+  <img src="assets/readme/vqgan-legacy-demo.png" width="60%">
+</p>
+
+### DeepDream
+
+<p align="center">
+  <img src="assets/readme/deepdream-demo.png" width="70%">
+</p>
+
+<p align="center">
+  <img src="assets/readme/deepdream-before.jpg" width="35%">
+  <img src="assets/readme/deepdream-after.jpg" width="35%">
+</p>
+
+Left, the SDXL sketch that goes in; right, what mixed6a at full Intensity
+does to it.
+
+### Style Transfer
+
+<p align="center">
+  <img src="assets/readme/style-original.jpg" width="20%">
+  <img src="assets/readme/style-watercolor.jpg" width="20%">
+  <img src="assets/readme/style-expressionist.jpg" width="20%">
+  <img src="assets/readme/style-gothic.jpg" width="20%">
+</p>
+
+Same source image, three different SDXL presets (leftmost is the original).
+
 ## Hardware & requirements
 
 - **Windows only.** There is no macOS or Linux build, and none is planned, at
