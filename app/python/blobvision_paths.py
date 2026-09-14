@@ -103,6 +103,9 @@ def _pick_file(preferred, *legacy):
     return preferred
 
 
+_work_dir_swept = False
+
+
 def ensure_layout():
     """Create V1 folders; migrate legacy weights/outputs when safe."""
     os.makedirs(MODELS_ROOT, exist_ok=True)
@@ -122,15 +125,31 @@ def ensure_layout():
     # block once its final render lands in outputs/ (see blobvision_video.py)
     # — this only leaves stale entries behind if the process was killed
     # mid-job. Sweep them on every startup so work/ never accumulates.
-    for name in os.listdir(work_dir()):
-        path = os.path.join(work_dir(), name)
-        try:
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                os.remove(path)
-        except OSError:
-            pass
+    #
+    # Guarded to run ONCE per process, not once per call: every engine
+    # module (blobvision_engine/_deepdream/_style/_caption/_sam/_upscale)
+    # calls ensure_layout() at its own import time, and those modules are
+    # imported lazily on first use, not all up front — so a family touched
+    # for the first time well into a session (confirmed: Style Transfer's
+    # SDXL-preset path importing blobvision_caption for the first time)
+    # would otherwise re-trigger this sweep mid-session and blow away
+    # whatever OTHER job's work/job_<uuid>/ happened to be active at that
+    # moment. Confirmed real bug: a Style Transfer SDXL-preset video job
+    # failed with "No such file or directory" on its own just-extracted
+    # first frame, deleted out from under it by this exact sweep firing
+    # from blobvision_caption's lazy first import mid-job.
+    global _work_dir_swept
+    if not _work_dir_swept:
+        _work_dir_swept = True
+        for name in os.listdir(work_dir()):
+            path = os.path.join(work_dir(), name)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            except OSError:
+                pass
 
     _migrate_tree(_LEGACY_VQGAN_DIR, VQGAN_MODEL_DIR, (
         VQGAN_CONFIG_NAME,
